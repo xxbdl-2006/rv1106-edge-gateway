@@ -1,0 +1,10 @@
+/v4l2_capture
+/v4l2_mpp_encode
+*.o
+*.nv12
+*.raw
+*.h264
+*.log
+*.core
+core
+core.*
