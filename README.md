@@ -89,6 +89,7 @@ MPU6050 / Mock Sensor -> Sensor RingBuffer -> OSD / Alarm
 ├── README.md
 ├── docs/
 │   ├── adb-flash.md
+│   ├── handoff.md
 │   └── roadmap.md
 ├── scripts/
 │   ├── diagnose_v4l2.sh
@@ -258,6 +259,12 @@ docs/adb-flash.md
 
 ```text
 docs/roadmap.md
+```
+
+项目级交接说明见：
+
+```text
+docs/handoff.md
 ```
 
 下一阶段优先实现：
