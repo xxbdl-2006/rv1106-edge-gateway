@@ -35,7 +35,14 @@ MEDIA_SRC := src/mpp_encoder.c src/sink_file.c src/sink_queue.c \
 	src/rtp_h264.c src/rtsp_proto.c src/rtsp_server.c \
 	src/frame_ring.c src/capture_thread.c
 
-.PHONY: all clean test host-syntax
+# Sensor sources are deliberately NOT part of MEDIA_SRC: nothing in the video
+# pipeline references them yet, so adding them here would only enlarge the
+# board binary without changing behaviour. src/mpu6050.c is host safe; the
+# transport half is empty on non-Linux, which is what lets the test target
+# below list it unconditionally.
+SENSOR_SRC := src/mpu6050.c src/mpu6050_i2c.c
+
+.PHONY: all clean test host-syntax mpu6050-probe
 
 all: v4l2_capture v4l2_mpp_encode
 
@@ -77,23 +84,48 @@ test-capture-thread: tests/test_capture_thread.c src/capture_thread.c \
 	$(HOSTCC) $(TEST_CFLAGS) -o $@ tests/test_capture_thread.c \
 		src/capture_thread.c src/frame_ring.c -lpthread
 
-test: test-packet-queue test-rtp-rtsp test-frame-ring test-capture-thread
+# Only src/mpu6050.c is compiled here; src/mpu6050_i2c.c is #ifdef __linux__
+# and would contribute nothing. The decoding maths is the part worth testing
+# and the part that is transport independent, which is the whole reason the
+# driver is split in two.
+test-mpu6050: tests/test_mpu6050.c src/mpu6050.c src/mpu6050.h
+	$(HOSTCC) $(TEST_CFLAGS) -o $@ tests/test_mpu6050.c src/mpu6050.c -lm
+
+test: test-packet-queue test-rtp-rtsp test-frame-ring test-capture-thread \
+	test-mpu6050
 	./test-packet-queue
 	./test-rtp-rtsp
 	./test-frame-ring
 	./test-capture-thread
+	./test-mpu6050
+
+# Board side only: cross compiled, talks to /dev/i2c-N.
+mpu6050-probe: tools/mpu6050-probe.c src/mpu6050.c src/mpu6050_i2c.c \
+	src/mpu6050.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tools/mpu6050-probe.c \
+		$(SENSOR_SRC) $(LDLIBS)
 
 # src/rtsp_server.c is the only file that needs POSIX sockets, which MinGW does
 # not provide. src/v4l2_mpp_encode.c cannot be checked here at all because it
 # pulls in linux/videodev2.h through v4l2_capture.c. On Windows these targets
 # still catch syntax errors, typos and new warnings through tests/host-stubs.
 # On Linux they are unnecessary but harmless.
+#
+# The last two define __linux__ so the Linux-only halves are compiled too,
+# against the stubs in tests/host-stubs/linux. That is how src/mpu6050_i2c.c
+# gets checked without a board; it already paid for itself by catching an
+# EREMOTEIO that uclibc does not always export.
 host-syntax: src/rtsp_server.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs \
-		-include extra.h $<
+		-include extra.h src/rtsp_server.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/capture_thread.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/frame_ring.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/mpu6050.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
+		src/mpu6050_i2c.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
+		tools/mpu6050-probe.c
 
 clean:
-	rm -f v4l2_capture v4l2_mpp_encode test-packet-queue test-rtp-rtsp \
-		test-frame-ring test-capture-thread
+	rm -f v4l2_capture v4l2_mpp_encode mpu6050-probe test-packet-queue \
+		test-rtp-rtsp test-frame-ring test-capture-thread test-mpu6050

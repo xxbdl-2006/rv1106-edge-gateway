@@ -8,6 +8,9 @@
 /test-frame-ring.exe
 /test-capture-thread
 /test-capture-thread.exe
+/test-mpu6050
+/test-mpu6050.exe
+/mpu6050-probe
 *.o
 *.nv12
 *.raw
