@@ -21,6 +21,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "capture_signal.h"
+
 #ifndef V4L2_PIX_FMT_NV12M
 #define V4L2_PIX_FMT_NV12M v4l2_fourcc('N', 'M', '1', '2')
 #endif
@@ -76,7 +78,13 @@ struct frame {
     struct v4l2_plane planes[VIDEO_MAX_PLANES];
 };
 
-static volatile sig_atomic_t g_stop;
+/*
+ * The capture thread shares this flag, so it has external linkage and lives
+ * behind capture_signal.h. Keeping the definition here preserves the original
+ * behaviour of the standalone v4l2_capture program, which is still built and
+ * used for diagnostics.
+ */
+volatile sig_atomic_t g_stop;
 
 static void on_signal(int signo)
 {

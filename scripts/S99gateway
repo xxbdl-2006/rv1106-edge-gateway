@@ -1,0 +1,349 @@
+#!/bin/sh
+#
+# /etc/init.d/S99gateway
+#
+# Boot the RV1106 gateway: stop rkipc, start the standalone 3A server, start
+# the gateway supervisor.
+#
+# Why the order matters and why it is not instant:
+#
+#   rkipc comes up with the system and owns the capture node. While it runs,
+#   nothing else can open /dev/video11 and the gateway dies with
+#   "VIDIOC_S_FMT: Device or resource busy". It has to go first.
+#
+#   The 3A server only attaches once the camera subsystem exists, and at S99
+#   that is not guaranteed yet. Rather than guess a delay, the takeover runs in
+#   the background and retries until the server stays up.
+#
+# Why the work is in a background worker:
+#
+#   rcS runs these scripts one after another. Waiting tens of seconds inline
+#   would hold up everything after us, including the USB network setup, so the
+#   board would not even be reachable over adb until the wait was over. `start`
+#   therefore returns immediately and `$0 takeover` does the slow part.
+#
+# Process naming: the supervisor is a shell script, so its process is called
+# "sh" and cannot be found by name. It publishes its own pid file instead.
+
+#
+# The Rockchip libraries live in /oem/usr/lib and are only reachable through
+# LD_LIBRARY_PATH. Nothing in the init environment sets it, which is why
+# rkaiq_3A_server died at boot with "can't load library 'librkaiq.so'" while
+# working fine over adb (where the login profile had already exported it).
+# S21appinit sources this file too; the gateway needs exactly the same
+# environment because it links the Rockit libraries from the same place.
+#
+#
+# Guarded by a flag because this script re-executes itself for the takeover:
+# RkEnv.sh appends to LD_LIBRARY_PATH, so sourcing it twice would add a second
+# copy of every path, and once per restart after that.
+#
+if [ -z "$GATEWAY_ENV_LOADED" ] && [ -f /etc/profile.d/RkEnv.sh ]; then
+    . /etc/profile.d/RkEnv.sh
+    GATEWAY_ENV_LOADED=1
+    export GATEWAY_ENV_LOADED
+fi
+
+GATEWAY_BINARY="/userdata/v4l2_mpp_encode"
+SUPERVISOR="/userdata/gateway-supervise.sh"
+RKAIQ_SERVER="/oem/usr/bin/rkaiq_3A_server"
+CAPTURE_DEVICE="/dev/video11"
+PIDFILE="/tmp/gateway-supervisor.pid"
+THREE_A_LOG="/tmp/rkaiq-3a.log"
+
+# Boot time is exactly when things go wrong and exactly when nobody is watching
+# the console. Everything is mirrored into a file on tmpfs, which survives long
+# enough to be read after the board comes up.
+BOOTLOG="/tmp/gateway-boot.log"
+
+boot_log() {
+    echo "$(date '+%H:%M:%S') $1" >> "$BOOTLOG" 2>/dev/null
+    echo "gateway: $1"
+}
+
+wait_for_path() {
+    waited=0
+    while [ "$waited" -lt 100 ]; do
+        [ -e "$1" ] && return 0
+        waited=$((waited + 1))
+        sleep 0.2
+    done
+    return 1
+}
+
+wait_for_process() {
+    waited=0
+    while [ "$waited" -lt 200 ]; do
+        pidof "$1" >/dev/null 2>&1 && return 0
+        waited=$((waited + 1))
+        sleep 0.1
+    done
+    return 1
+}
+
+# rkipc is only useful once it has actually opened the capture node: that is
+# when the sensor and the ISP are initialised.
+rkipc_is_streaming() {
+    for pid in $(pidof rkipc); do
+        if ls -l "/proc/$pid/fd" 2>/dev/null | grep -q video11; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+wait_for_rkipc_streaming() {
+    waited=0
+    while [ "$waited" -lt 300 ]; do
+        rkipc_is_streaming && return 0
+        waited=$((waited + 1))
+        sleep 0.1
+    done
+    return 1
+}
+
+# Kill every process with this name.
+#
+# Uses the shell builtin kill plus pidof, not killall. killall did resolve here
+# but it silently did nothing, and with stderr redirected the failure was
+# invisible; pidof already works in this environment and kill is a builtin, so
+# neither can go missing.
+stop_by_name() {
+    pids=$(pidof "$1")
+    boot_log "$1 pids before: [$pids]"
+    for pid in $pids; do
+        kill -9 "$pid" 2>/dev/null
+    done
+}
+
+# Start the 3A server directly rather than through start_rkaiq.sh.
+#
+# That helper runs the server with --silent, so when it dies the reason is lost.
+# Starting it here keeps its stderr, which is the difference between "3A failed"
+# and knowing why.
+start_3a_server() {
+    if pidof rkaiq_3A_server >/dev/null 2>&1; then
+        boot_log "3A server already running"
+        return 0
+    fi
+
+    if [ ! -x "$RKAIQ_SERVER" ]; then
+        boot_log "$RKAIQ_SERVER is missing"
+        return 1
+    fi
+
+    rm -f "$THREE_A_LOG"
+    "$RKAIQ_SERVER" >"$THREE_A_LOG" 2>&1 &
+    sleep 3
+
+    if pidof rkaiq_3A_server >/dev/null 2>&1; then
+        boot_log "3A server running as $(pidof rkaiq_3A_server)"
+        return 0
+    fi
+
+    boot_log "3A server exited straight away, its output was:"
+    while read -r line; do
+        boot_log "  3A| $line"
+    done < "$THREE_A_LOG"
+
+    return 1
+}
+
+supervisor_pid() {
+    if [ ! -f "$PIDFILE" ]; then
+        return 1
+    fi
+
+    pid=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -z "$pid" ] || [ ! -d "/proc/$pid" ]; then
+        return 1
+    fi
+
+    echo "$pid"
+    return 0
+}
+
+# The slow part: waits for the camera, takes it over, starts everything.
+takeover_task() {
+    boot_log "takeover started, LD_LIBRARY_PATH=[$LD_LIBRARY_PATH]"
+
+    if supervisor_pid >/dev/null 2>&1; then
+        boot_log "supervisor already running, nothing to do"
+        return 0
+    fi
+
+    if ! wait_for_path "$GATEWAY_BINARY"; then
+        boot_log "$GATEWAY_BINARY did not appear in 20s, is /userdata mounted?"
+        boot_log "mount table: $(mount | grep userdata)"
+        return 1
+    fi
+    boot_log "/userdata is ready"
+
+    if [ ! -x "$GATEWAY_BINARY" ]; then
+        boot_log "$GATEWAY_BINARY is not executable"
+        return 1
+    fi
+
+    if [ ! -x "$SUPERVISOR" ]; then
+        boot_log "$SUPERVISOR is not executable"
+        return 1
+    fi
+
+    if ! wait_for_process rkipc; then
+        boot_log "rkipc never appeared in 20s, continuing anyway"
+    elif wait_for_rkipc_streaming; then
+        boot_log "rkipc is streaming on $CAPTURE_DEVICE, taking the camera over"
+    else
+        boot_log "rkipc never opened $CAPTURE_DEVICE in 30s, continuing anyway"
+    fi
+
+    stop_by_name rkipc
+    sleep 2
+
+    remaining=$(pidof rkipc)
+    if [ -n "$remaining" ]; then
+        boot_log "rkipc survived as [$remaining], the capture node stays busy"
+        return 1
+    fi
+    boot_log "rkipc is gone"
+
+    boot_log "starting the 3A server"
+    attempt=0
+    delay=3
+    while [ "$attempt" -lt 5 ]; do
+        attempt=$((attempt + 1))
+        boot_log "3A attempt $attempt"
+
+        if start_3a_server; then
+            break
+        fi
+
+        if [ "$attempt" -lt 5 ]; then
+            boot_log "retrying in ${delay}s"
+            sleep "$delay"
+            delay=$((delay * 2))
+        fi
+    done
+
+    if ! pidof rkaiq_3A_server >/dev/null 2>&1; then
+        boot_log "gave up on the 3A server"
+        return 1
+    fi
+
+    boot_log "starting the supervisor"
+    rm -f "$PIDFILE"
+
+    # setsid matters here as much as it does for adb: without it the supervisor
+    # joins the caller's session, and whoever started this script takes the
+    # whole process group down on its way out.
+    if [ -x /usr/bin/setsid ]; then
+        /usr/bin/setsid "$SUPERVISOR" >/dev/null 2>&1 &
+    else
+        "$SUPERVISOR" >/dev/null 2>&1 &
+    fi
+
+    sleep 2
+    if ! supervisor_pid >/dev/null 2>&1; then
+        boot_log "the supervisor died immediately, it never wrote its pid file"
+        return 1
+    fi
+
+    boot_log "gateway is up, supervisor pid $(supervisor_pid)"
+    return 0
+}
+
+start_service() {
+    boot_log "start requested"
+
+    if supervisor_pid >/dev/null 2>&1; then
+        boot_log "supervisor already running"
+        return 0
+    fi
+
+    # Detach so the worker outlives this script, without making the caller wait
+    # for the camera.
+    if [ -x /usr/bin/setsid ]; then
+        /usr/bin/setsid "$0" takeover >/dev/null 2>&1 &
+    else
+        "$0" takeover >/dev/null 2>&1 &
+    fi
+
+    #
+    # Stay alive for a moment so the worker can finish its setsid.
+    #
+    # Without this the script returns instantly, the caller's session is torn
+    # down, and adbd kills the whole process group before the child has left
+    # it. That made `start` work about half the time when driven over adb,
+    # while being perfectly reliable from rcS where the session does not end.
+    #
+    sleep 2
+    return 0
+}
+
+stop_service() {
+    boot_log "stop requested"
+
+    # Kill the supervisor first, otherwise its restart loop brings the encoder
+    # straight back.
+    pid=$(supervisor_pid 2>/dev/null)
+    if [ -n "$pid" ]; then
+        kill -TERM "$pid" 2>/dev/null
+        sleep 1
+        kill -9 "$pid" 2>/dev/null
+    fi
+    rm -f "$PIDFILE"
+
+    stop_by_name v4l2_mpp_encode
+    sleep 1
+    stop_by_name v4l2_mpp_encode
+
+    return 0
+}
+
+status_service() {
+    pid=$(supervisor_pid 2>/dev/null)
+    if [ -n "$pid" ]; then
+        echo "gateway: supervisor running (pid $pid)"
+    else
+        echo "gateway: supervisor not running"
+    fi
+
+    if pidof v4l2_mpp_encode >/dev/null 2>&1; then
+        echo "gateway: encoder running (pid $(pidof v4l2_mpp_encode))"
+    else
+        echo "gateway: encoder not running"
+    fi
+
+    if pidof rkaiq_3A_server >/dev/null 2>&1; then
+        echo "gateway: 3A server running (pid $(pidof rkaiq_3A_server))"
+    else
+        echo "gateway: 3A server not running"
+    fi
+
+    if pidof rkipc >/dev/null 2>&1; then
+        echo "gateway: warning, rkipc is running"
+    fi
+}
+
+case "$1" in
+    start)
+        start_service
+        ;;
+    takeover)
+        takeover_task
+        ;;
+    stop)
+        stop_service
+        ;;
+    restart)
+        stop_service
+        start_service
+        ;;
+    status)
+        status_service
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac

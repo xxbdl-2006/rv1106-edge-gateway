@@ -24,6 +24,7 @@ struct mpp_encoder {
     uint32_t ver_stride;
     size_t frame_size;
     uint32_t time_ref;
+    int quiet;
     bool sys_initialized;
     bool pool_created;
     bool channel_created;
@@ -74,6 +75,7 @@ int mpp_encoder_open(struct mpp_encoder **encoder_ptr,
     encoder->ver_stride = align_up(config->height, 16U);
     encoder->frame_size = (size_t)encoder->hor_stride *
                           encoder->ver_stride * 3U / 2U;
+    encoder->quiet = (config->quiet != 0) ? 1 : 0;
 
     if (check_rk_result("RK_MPI_SYS_Init", RK_MPI_SYS_Init()) == -1) {
         goto fail;
@@ -199,12 +201,12 @@ int mpp_encoder_encode_nv12(struct mpp_encoder *encoder,
                             const void *nv12,
                             size_t size,
                             uint64_t pts,
-                            FILE *output)
+                            struct packet_sink *sink)
 {
     void *destination;
     RK_S32 result;
 
-    if (encoder == NULL || nv12 == NULL || output == NULL ||
+    if (encoder == NULL || nv12 == NULL || sink == NULL ||
         !encoder->channel_created || encoder->frame_block == NULL) {
         return -1;
     }
@@ -251,76 +253,114 @@ int mpp_encoder_encode_nv12(struct mpp_encoder *encoder,
         return -1;
     }
 
-    fprintf(stderr,
-            "VENC frame %u: packs=%u first_len=%u segments=%u\n",
-            encoder->frame.stVFrame.u32TimeRef,
-            encoder->stream.u32PackCount,
-            encoder->stream.pstPack[0].u32Len,
-            encoder->stream.pstPack[0].u32DataNum);
+    int write_result;
 
-    for (uint32_t index = 0; index < encoder->stream.u32PackCount; index++) {
-        VENC_PACK_S *pack = &encoder->stream.pstPack[index];
-        uint8_t *base;
+    /*
+     * Gather every run of bytes the encoder produced into a small stack array
+     * before the stream is released. Nothing is copied here: sinks get the
+     * engine memory directly and only the ones that need to keep the data
+     * around (the packet queue) pay for a copy.
+     */
+    {
+        struct packet_segment segments[PACKET_SINK_MAX_SEGMENTS];
+        size_t segment_count = 0U;
 
-        base = RK_MPI_MB_Handle2VirAddr(pack->pMbBlk);
-        if (base == NULL) {
-            fprintf(stderr, "Encoded packet has no CPU mapping\n");
-            (void)RK_MPI_VENC_ReleaseStream(ENCODER_CHANNEL,
-                                            &encoder->stream);
-            return -1;
+        if (encoder->quiet == 0) {
+            fprintf(stderr,
+                    "VENC frame %u: packs=%u first_len=%u segments=%u\n",
+                    encoder->frame.stVFrame.u32TimeRef,
+                    encoder->stream.u32PackCount,
+                    encoder->stream.pstPack[0].u32Len,
+                    encoder->stream.pstPack[0].u32DataNum);
         }
 
-        if (pack->u32DataNum > 0U) {
-            for (uint32_t part = 0U;
-                 part < pack->u32DataNum &&
-                 part < sizeof(pack->stPackInfo) /
-                        sizeof(pack->stPackInfo[0]);
-                 part++) {
-                VENC_PACK_INFO_S *info = &pack->stPackInfo[part];
+        for (uint32_t index = 0U;
+             index < encoder->stream.u32PackCount;
+             index++) {
+            VENC_PACK_S *pack = &encoder->stream.pstPack[index];
+            uint8_t *base;
 
-                if (info->u32PackLength > 0U &&
-                    fwrite(base + info->u32PackOffset,
-                           1U,
-                           info->u32PackLength,
-                           output) != info->u32PackLength) {
-                    fprintf(stderr, "Failed to write H.264 packet: %s\n",
-                            strerror(errno));
+            base = RK_MPI_MB_Handle2VirAddr(pack->pMbBlk);
+            if (base == NULL) {
+                fprintf(stderr, "Encoded packet has no CPU mapping\n");
+                (void)RK_MPI_VENC_ReleaseStream(ENCODER_CHANNEL,
+                                                &encoder->stream);
+                return -1;
+            }
+
+            if (pack->u32DataNum > 0U) {
+                for (uint32_t part = 0U;
+                     part < pack->u32DataNum &&
+                     part < sizeof(pack->stPackInfo) /
+                            sizeof(pack->stPackInfo[0]);
+                     part++) {
+                    VENC_PACK_INFO_S *info = &pack->stPackInfo[part];
+
+                    if (info->u32PackLength == 0U) {
+                        continue;
+                    }
+
+                    if (segment_count >= PACKET_SINK_MAX_SEGMENTS) {
+                        fprintf(stderr,
+                                "Encoded frame has more than %d segments\n",
+                                PACKET_SINK_MAX_SEGMENTS);
+                        (void)RK_MPI_VENC_ReleaseStream(ENCODER_CHANNEL,
+                                                        &encoder->stream);
+                        return -1;
+                    }
+
+                    segments[segment_count].data =
+                        base + info->u32PackOffset;
+                    segments[segment_count].length = info->u32PackLength;
+                    segment_count++;
+                }
+            } else if (pack->u32Len > 0U) {
+                if (segment_count >= PACKET_SINK_MAX_SEGMENTS) {
+                    fprintf(stderr,
+                            "Encoded frame has more than %d segments\n",
+                            PACKET_SINK_MAX_SEGMENTS);
                     (void)RK_MPI_VENC_ReleaseStream(ENCODER_CHANNEL,
                                                     &encoder->stream);
                     return -1;
                 }
+
+                segments[segment_count].data = base + pack->u32Offset;
+                segments[segment_count].length = pack->u32Len;
+                segment_count++;
             }
-        } else if (pack->u32Len > 0U &&
-                   fwrite(base + pack->u32Offset,
-                          1U,
-                          pack->u32Len,
-                          output) != pack->u32Len) {
-            fprintf(stderr, "Failed to write H.264 packet: %s\n",
-                    strerror(errno));
-            (void)RK_MPI_VENC_ReleaseStream(ENCODER_CHANNEL,
-                                            &encoder->stream);
-            return -1;
         }
+
+        write_result = packet_sink_write(sink,
+                                         pts / 1000U,
+                                         segments,
+                                         segment_count);
     }
 
+    /*
+     * The stream is always released, even when the sink failed, otherwise the
+     * encoder runs out of output buffers after a couple of frames.
+     */
     result = RK_MPI_VENC_ReleaseStream(ENCODER_CHANNEL, &encoder->stream);
     if (check_rk_result("RK_MPI_VENC_ReleaseStream", result) == -1) {
         return -1;
     }
 
-    if (fflush(output) == EOF) {
-        perror("fflush");
+    if (write_result != 0) {
+        return -1;
+    }
+
+    if (packet_sink_flush(sink) != 0) {
         return -1;
     }
 
     return 0;
 }
 
-int mpp_encoder_flush(struct mpp_encoder *encoder, FILE *output)
+int mpp_encoder_flush(struct mpp_encoder *encoder, struct packet_sink *sink)
 {
     (void)encoder;
 
-    if (output == NULL || fflush(output) == EOF) {
+    if (sink == NULL || packet_sink_flush(sink) != 0) {
         return -1;
     }
 

@@ -50,13 +50,37 @@ MPU6050 -> /dev/i2c-4 -> Sensor RingBuffer -> OSD/Alarm
 | SC3336 | 已完成 | MIPI CSI、ISP、V4L2 节点正常 |
 | 3A | 已完成 | `rkaiq_3A_server --silent` 可稳定曝光和白平衡 |
 | V4L2 采集 | 已完成 | 1280x720 NV12，300 帧约 30 FPS |
-| MPP 编码 | 已完成 | 硬件 H.264 编码到文件 |
+| MPP 编码 | 已完成 | 硬件 H.264 编码 |
 | 文件播放 | 已完成 | 生成的 H.264 可由 VLC 正常播放 |
-| RTSP | 未完成 | 下一阶段主要任务 |
-| RingBuffer/多线程 | 未完成 | RTSP 后实施 |
+| Packet Sink/Queue | 已完成 | File Sink、Queue Sink、有界丢帧队列 |
+| RTSP over TCP | 已完成 | 多客户端 fan-out，已上板验证 |
+| Frame RingBuffer | 已完成 | `--threads` 采集线程独立，已主机自测 |
+| 开机自启 | 已完成 | 重启后 11 秒自动出流，已二次重启验证 |
+| 长稳测试 | 进行中 | 累计 6.5 小时零丢帧，待 8 小时正式验收 |
 | MPU6050 | 未完成 | 当前硬件尚未接入 |
 
-当前代码是单进程、单线程、文件输出版本。它是有意保留的稳定基线。
+详细的验收数据见 `docs/status.md`。
+
+### 3.1 RTSP 阶段的实际交付
+
+```text
+--sink file   encoder -> file，与基线逐字节一致
+--sink queue  encoder -> 有界队列 -> 落盘线程，用于回归验证队列
+--sink rtsp   encoder -> 有界队列 -> RTSP over TCP 多客户端
+```
+
+线程模型（`src/rtsp_server.c`）分三层，**不要改回每客户端各自取队列**：
+
+```text
+listener  accept + 回收已结束会话
+reader    队列的唯一消费者，每帧 packetize 一次后扇出给所有客户端
+client    每连接一个线程，只做请求/应答，绝不碰队列
+```
+
+原因是 RTP 的 seq/timestamp 是**流的属性而不是连接的属性**。若每个客户端各自
+`acquire()`，帧会被随机瓜分，所有观众同时花屏。同理，PLAY 时不重置 RTP 时间戳，
+因为那会打断正在观看的其他人。
+
 
 ## 4. Git 仓库
 
@@ -378,16 +402,22 @@ MppCtxType error 0
 
 优先级顺序：
 
-1. 保留当前文件编码版本为 Baseline。
-2. 将 `FILE *` 输出改为 Packet Sink。
-3. 实现 File Sink 和 Packet Queue。
-4. 实现 RTSP over TCP 单客户端。
-5. 实现 H.264 RTP 打包。
-6. 增加断线重连和多客户端。
-7. 增加 Frame RingBuffer 和编码线程。
+1. ~~保留当前文件编码版本为 Baseline。~~ 已完成。
+2. ~~将 `FILE *` 输出改为 Packet Sink。~~ 已完成。
+3. ~~实现 File Sink 和 Packet Queue。~~ 已完成。
+4. ~~实现 RTSP over TCP 单客户端。~~ 已完成。
+5. ~~实现 H.264 RTP 打包。~~ 已完成。
+6. ~~增加断线重连和多客户端。~~ 已完成。
+7. ~~增加 Frame RingBuffer 和编码线程。~~ 代码已完成，**待上板验证**。
 8. 增加 Mock Sensor 和 OSD 数据面。
 9. 接入真实 MPU6050。
-10. 做开机服务和 8 小时稳定性测试。
+10. 做开机服务和 8 小时稳定性测试。（开机服务已完成，8 小时长稳进行中）
+
+已完成项的实测数据和根因分析见：
+
+```text
+docs/status.md
+```
 
 详细路线见：
 

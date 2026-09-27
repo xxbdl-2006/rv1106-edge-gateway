@@ -3,7 +3,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
+
+#include "packet_sink.h"
 
 struct mpp_encoder;
 
@@ -16,6 +17,12 @@ struct mpp_encoder_config {
     uint32_t fps_den;
     uint32_t gop;
     int32_t bitrate;
+    /*
+     * Suppress the per frame encoder trace. It is useful while tuning the
+     * pipeline but it writes 30 lines a second, which is not acceptable for a
+     * gateway that is meant to run unattended.
+     */
+    int quiet;
 };
 
 int mpp_encoder_open(struct mpp_encoder **encoder,
@@ -25,9 +32,9 @@ int mpp_encoder_encode_nv12(struct mpp_encoder *encoder,
                             const void *nv12,
                             size_t size,
                             uint64_t pts,
-                            FILE *output);
+                            struct packet_sink *sink);
 
-int mpp_encoder_flush(struct mpp_encoder *encoder, FILE *output);
+int mpp_encoder_flush(struct mpp_encoder *encoder, struct packet_sink *sink);
 
 void mpp_encoder_close(struct mpp_encoder *encoder);
 

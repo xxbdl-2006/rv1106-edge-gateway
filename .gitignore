@@ -1,5 +1,13 @@
 /v4l2_capture
 /v4l2_mpp_encode
+/test-packet-queue
+/test-packet-queue.exe
+/test-rtp-rtsp
+/test-rtp-rtsp.exe
+/test-frame-ring
+/test-frame-ring.exe
+/test-capture-thread
+/test-capture-thread.exe
 *.o
 *.nv12
 *.raw
