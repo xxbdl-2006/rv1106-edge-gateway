@@ -443,7 +443,37 @@ CHECK(written[2] == 0xD1);   /* 0x68 << 1 | read  <- 读/写位最容易搞错 *
 
 ## 6. 板端编译与上板验证
 
-**Windows 侧没有 SDK，必须在 VM 里交叉编译**（`/mnt/hgfs/luckfox_share/rv1103`）：
+### 一键脚本（推荐）
+
+**Windows 侧没有 SDK，必须在 VM 里跑**（代码在 `/mnt/hgfs/luckfox_share/rv1103`）：
+
+```bash
+cd /mnt/hgfs/luckfox_share/rv1103
+./scripts/verify-mpu6050.sh
+```
+
+脚本按顺序做五件事，**每步都有自己的前置检查**，失败时会说是哪一步：
+
+| 步骤 | 检查什么 | 失败的含义 |
+|---|---|---|
+| 1. 找工具链 | `arm-rockchip830-...-gcc` 是否可用 | PATH 没配好，或 SDK 路径不对 |
+| 2. 交叉编译 | 编译成功 + **ELF `e_machine=0x2800`** | 编出的是 host 二进制（推上去会报"找不到"） |
+| 3. 查板子 | adb 在线 + **pin 70/71 `MUX UNCLAIMED`** | 引脚被驱动占了，用户态无法救 |
+| 4. 推送运行 | **push 后字节数核对** + 跑 `--dump` | push 被中断会留下 0 字节文件 |
+| 5. 判定结果 | 四个数字自动检查 | 见下表 |
+
+**为什么要写成脚本而不是文档里的命令清单**：有五步必须按序做，而几种最典型的失败
+（字节序错、二进制过期、工具链不在 PATH）**从外面看都是「传感器坏了」**。
+每步自查能直接指出是哪一环。
+
+如果工具链不在默认位置：
+
+```bash
+CROSS_COMPILE=arm-rockchip830-linux-uclibcgnueabihf- ./scripts/verify-mpu6050.sh
+SDK_ROOT=/你的/luckfox-pico ./scripts/verify-mpu6050.sh
+```
+
+### 手工步骤（脚本失败时排查用）
 
 ```bash
 cd /mnt/hgfs/luckfox_share/rv1103
@@ -458,6 +488,21 @@ adb push mpu6050-probe /userdata/
 adb shell "/userdata/mpu6050-probe"                # 扫描
 adb shell "/userdata/mpu6050-probe --dump"         # 扫描 + 读取
 adb shell "/userdata/mpu6050-probe --delay 10 --dump --count 20"
+```
+
+**推上去先核字节数**（`adb push` 被打断会留 0 字节文件，而它照样出现在 `ls` 里）：
+
+```bash
+wc -c < mpu6050-probe                              # 本地
+adb shell "wc -c < /userdata/mpu6050-probe"        # 板端，应一致
+```
+
+**最有力的交叉验证**：板子上还留着**已经跑通过的 Python 版**
+`/userdata/i2c-bitbang.py`。C 版的结果必须和它一致 ——
+**如果 Python 找得到而 C 版找不到，那就是移植错了，不是硬件问题**：
+
+```bash
+adb shell "python3 /userdata/i2c-bitbang.py scan"
 ```
 
 预期输出：
@@ -481,7 +526,7 @@ WHO_AM_I = 0x70 (MPU6500)
 gyro[dps] means: +0.001 -0.002 +0.000
 ```
 
-**四个判据**：
+**四个判据**（`verify-mpu6050.sh` 会自动检查这四条并给出 PASS/FAIL）：
 
 | 看什么 | 期望 | 说明 |
 |---|---|---|
@@ -494,6 +539,9 @@ gyro[dps] means: +0.001 -0.002 +0.000
 - 两个都是 1.062 → 校准静默失效
 - calibrated 是 0.000 → 偏置把重力吃掉了（见 §2 的警告）
 - raw 就是 1.000 → 这颗不是常数所描述的那颗传感器
+
+> 脚本的判定逻辑用**人造输出**验证过四种情形（正常 / 重力被抹掉 / 校准未生效 / 有 NACK），
+> 四种都判对了，且正常情形不误报。
 
 **诊断线索**：
 - `io error(s)` 在涨 → 引脚写不动：权限、或已被驱动占用
