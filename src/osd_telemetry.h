@@ -77,14 +77,42 @@
 #define OSD_ALARM_MAG_TOLERANCE_G 0.25f  /* |a| outside 1 g by this much */
 
 /*
- * How many lines this layer emits, and therefore how tall the canvas must be.
+ * How many lines this layer emits, and how wide the widest one can get.
  *
  * Exposed rather than kept private in the .c because the canvas is sized from
- * it at open time, and a caller that wants to know how much of the frame the
- * overlay will occupy needs the same number. Frames that drain a sensor + video
- * pipeline at 30 fps should not have to guess.
+ * them at open time, and a caller that wants to know how much of the frame the
+ * overlay will occupy needs the same numbers.
+ *
+ * OSD_TELEMETRY_WIDTH is the width in characters of the longest line the
+ * formatter below can produce, with every field at its maximum. That matters
+ * more than it looks: the canvas is allocated once and the composite REFUSES a
+ * frame it does not fit in, so an over-generous width does not just waste
+ * memory - it makes the overlay silently absent on frames narrower than the
+ * bound. Sizing off OSD_MAX_LINE_CHARS (64) instead of this would cost 384
+ * pixels of reserved width for lines that are about 30 characters long, which
+ * is the difference between an overlay that works on a 320-wide preview and one
+ * that never appears at all.
+ *
+ * The value is the longest of:
+ *   "PITCH +179.9  ROLL +179.9  TILT"     (31)
+ *   "ACC 9.99 g  TEMP 99.9 C  IMU MAG"    (33)
+ *   "T 99999:00:00  FRAME 18446744073709551615  999.9 fps"  (unbounded)
+ *   "IMU mock STALE e=18446744073709551615  SENSOR"          (unbounded)
+ *
+ * The last two are genuinely unbounded because they contain 64 bit counters, so
+ * a bound has to be chosen rather than derived. 48 is chosen: it covers the
+ * counters for any run shorter than about 100 hours at any plausible frame rate,
+ * which is far beyond the 8 hour soak this is built for, and it is still narrow
+ * enough to fit a 720p frame with room to spare.
+ *
+ * What happens when the bound is exceeded is deliberate: builder_puts() stops
+ * appending at the capacity, so a line clips at its right edge rather than
+ * overrunning. A clipped counter is less bad than a corrupted frame, and the
+ * alternative - growing the canvas - is not available because this runs per
+ * frame.
  */
 #define OSD_TELEMETRY_LINES 4U
+#define OSD_TELEMETRY_WIDTH 48U
 
 struct osd_telemetry_clock {
     /* Monotonic microseconds since the program started. */

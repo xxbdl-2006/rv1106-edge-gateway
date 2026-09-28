@@ -790,6 +790,72 @@ static void test_telemetry_angle_formatting(void)
     }
 }
 
+/*
+ * The overlay canvas is sized from OSD_TELEMETRY_WIDTH, and the composite
+ * REFUSES a frame the canvas does not fit in - so an underestimate here does
+ * not clip the text, it makes the overlay silently absent. That failure mode is
+ * invisible unless something checks it, which is what this does.
+ *
+ * It also pins the other direction: the declared width has to be enough for
+ * every line the formatter can actually emit, including the widest values the
+ * counters can reach in a normal run. A bound that is too small clips a counter
+ * at its right edge, which is survivable but should be a deliberate choice
+ * rather than a surprise.
+ */
+static void test_canvas_width_is_sufficient(void)
+{
+    struct osd_telemetry_input input;
+    char lines[OSD_MAX_LINES][OSD_MAX_LINE_CHARS];
+    size_t count;
+    size_t line;
+    size_t widest = 0U;
+
+    /* Push every field toward its widest plausible form: a negative
+     * two-and-a-half digit angle with an alarm, a long source name that is not
+     * in the font, and counters large enough to matter. */
+    make_input(&input, -179.9f, 179.9f, 9.99f, true);
+    input.sensor.source_name = "mpu6050";
+    input.sensor.last_read_failed = true;
+    input.sensor.read_errors = 999999UL;
+    input.clock.now_us = 359999000000ULL;   /* ~100 hours */
+    input.clock.frame_count = 9999999ULL;
+    input.clock.frame_rate = 999.9f;
+
+    count = osd_telemetry_format_lines(&input, lines, OSD_MAX_LINES);
+    CHECK(count > 0U, "%s", "no lines to measure");
+
+    for (line = 0U; line < count; line++) {
+        size_t width = strlen(lines[line]);
+
+        if (width > widest) {
+            widest = width;
+        }
+        printf("  width check: %2zu chars |%s|\n", width, lines[line]);
+    }
+
+    CHECK(widest <= (size_t)OSD_TELEMETRY_WIDTH,
+          "widest line is %zu chars but the canvas only holds %u",
+          widest, (unsigned)OSD_TELEMETRY_WIDTH);
+
+    /*
+     * And the canvas that results must fit a 720p frame at the origin the
+     * default config uses, or the overlay would never appear on the real
+     * stream - which is exactly the bug this bound was narrowed to fix.
+     */
+    {
+        size_t canvas_width =
+            (size_t)OSD_TELEMETRY_WIDTH * (size_t)OSD_FONT_ADVANCE;
+        size_t canvas_height = osd_overlay_lines_height(OSD_TELEMETRY_LINES);
+
+        CHECK(canvas_width <= 1280U,
+              "canvas is %zu px wide, wider than the 1280 frame",
+              canvas_width);
+        CHECK(canvas_height <= 720U,
+              "canvas is %zu px tall, taller than the 720 frame",
+              canvas_height);
+    }
+}
+
 static void test_telemetry_no_sample(void)
 {
     struct osd_telemetry_input input;
@@ -1029,6 +1095,7 @@ int main(void)
     printf(" telemetry:\n");
     test_telemetry_lines();
     test_telemetry_angle_formatting();
+    test_canvas_width_is_sufficient();
     test_telemetry_no_sample();
     test_telemetry_alarms();
     test_telemetry_render();

@@ -436,18 +436,18 @@ int osd_telemetry_open(const struct osd_telemetry_config *config,
     }
 
     /*
-     * The canvas is sized for the worst case the layout can produce: the
-     * longest line the formatter can emit, over the full complement of lines,
-     * plus the panel padding on both sides. Sizing it off the current values
-     * would mean the overlay changed size when a sensor went stale, and a
-     * per-frame reallocation is exactly what the project forbids.
+     * The canvas is sized for the worst case the layout can produce, measured
+     * in the widest line this file can emit rather than in the scratch buffer's
+     * capacity. Both are "no per-frame reallocation", but only one of them also
+     * fits on a narrow frame - and a canvas that does not fit means the
+     * composite refuses and the overlay is silently absent. See the note on
+     * OSD_TELEMETRY_WIDTH.
      *
-     * OSD_MAX_LINE_CHARS is the true worst case rather than a guess at the
-     * longest string below: a guess has to be updated whenever a line is added,
-     * and the failure mode when somebody forgets is a clipped line, which is
-     * silent.
+     * Sizing off the current values instead would mean the overlay changed size
+     * when a sensor went stale, which is the per-frame reallocation the project
+     * forbids.
      */
-    overlay_config.width = OSD_MAX_LINE_CHARS * (size_t)OSD_FONT_ADVANCE;
+    overlay_config.width = OSD_TELEMETRY_WIDTH * (size_t)OSD_FONT_ADVANCE;
     overlay_config.height =
         osd_overlay_lines_height(OSD_TELEMETRY_LINES) +
         2U * created->config.panel_padding;
