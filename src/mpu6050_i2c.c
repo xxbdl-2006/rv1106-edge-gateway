@@ -1,5 +1,18 @@
 /*
- * MPU6050 transport: the only file in this driver that touches /dev/i2c-N.
+ * MPU6050 transport over bit-banged I2C.
+ *
+ * The driver used to talk to /dev/i2c-N. That stopped being possible on this
+ * board: the i2c3 controller serving header pins 24/14 is status = "disabled"
+ * in the device tree, and the runtime overlay route that would flip it turned
+ * out not to work (see dts/i2c3-enable.dts for the evidence). Driving the pins
+ * directly sidesteps the controller entirely, because a disabled controller
+ * never claims its pinctrl and leaves the pins as plain GPIO.
+ *
+ * Split of responsibility:
+ *
+ *   i2c_bitbang.c   I2C timing, host testable, no I/O
+ *   gpio_sysfs.c    the sysfs pin backend, Linux only
+ *   this file       MPU6050 register policy on top of both
  *
  * Kept separate from mpu6050.c so the decoding stays host-testable. This file
  * is inherently Linux-only; on Windows it compiles to nothing, which lets the
@@ -11,28 +24,51 @@
 #ifdef __linux__
 
 #include <errno.h>
-#include <fcntl.h>
-#include <linux/i2c-dev.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <time.h>
-#include <unistd.h>
+
+#include "gpio_sysfs.h"
+#include "i2c_bitbang.h"
 
 /*
- * EREMOTEIO is the errno a Linux I2C adapter returns when a slave did not
+ * EREMOTEIO is the errno a Linux I2C stack returns when a slave did not
  * acknowledge. It is spelled EREMOTEIO in glibc but some uclibc
  * configurations do not export it, so it is defined here as a fallback rather
- * than allowed to break the build. The value 121 is the Linux ABI value and
- * is stable, so the fallback is not a guess.
+ * than allowed to break the build. The value 121 is the Linux ABI value and is
+ * stable, so the fallback is not a guess.
  */
 #ifndef EREMOTEIO
 #define EREMOTEIO 121
 #endif
 
+/*
+ * Header pin 24 is SCL and pin 14 is SDA, both on the i2c3 M0 mux group.
+ * Their plain GPIO numbers are what the sysfs backend wants, and the mapping
+ * is SoC-pin = bank*32 + group*8 + index, so GPIO2_A6 -> 70 and GPIO2_A7 -> 71.
+ *
+ * These are the values from the board's own pinmux output, not a guess:
+ *   pin 70 (gpio2-6) (MUX UNCLAIMED)
+ *   pin 71 (gpio2-7) (MUX UNCLAIMED)
+ * UNCLAIMED is what makes this whole approach legal; a claimed pin would mean
+ * the controller is already running and we should have used /dev/i2c-3.
+ */
+#define MPU6050_BITBANG_SCL_GPIO 70
+#define MPU6050_BITBANG_SDA_GPIO 71
+
+/*
+ * 25 us per half period, so roughly 20 kHz. sysfs costs 10-50 us per access on
+ * this SoC, so a smaller number would mostly be swallowed by that overhead and
+ * would only add jitter. An I2C target has no minimum clock rate, and the
+ * 14 byte burst still finishes in a few milliseconds, which is far faster than
+ * the 100 Hz sampling this feeds.
+ */
+#define MPU6050_BITBANG_HALF_PERIOD_US 25
+
 struct mpu6050_imu {
-    int fd;
+    struct sysfs_gpio *gpio;
+    struct i2c_bitbang bus;
     uint8_t address;
     float accel_scale;
     float gyro_scale;
@@ -40,66 +76,15 @@ struct mpu6050_imu {
     int gyro_fsr;
 };
 
-/*
- * Check that the adapter can do raw slave transfers.
- *
- * I2C_FUNCS is the documented capability query, but the macro is missing from
- * some uclibc headers, so it is probed with #ifdef rather than assumed. When
- * the adapter cannot be queried the code proceeds optimistically: the read
- * and write paths below fail cleanly anyway, and refusing to open a bus just
- * because it cannot describe itself would be worse than trying.
- */
-static int check_adapter_caps(int fd)
-{
-#ifdef I2C_FUNCS
-    unsigned long funcs = 0;
-
-    if (ioctl(fd, I2C_FUNCS, &funcs) < 0)
-        return 0; /* cannot tell; let the real transfers decide */
-
-    /*
-     * SMBus byte-level access is what the probe write relies on. Adapters
-     * that lack it still support plain read/write in slave mode, so this is
-     * reported through errno only when the basic capability is absent too.
-     */
-    if (!(funcs & (I2C_FUNC_I2C | I2C_FUNC_SMBUS_WRITE_BYTE))) {
-        errno = ENOSYS;
-        return -1;
-    }
-#else
-    (void)fd;
-#endif
-    return 0;
-}
-
-/* Force the adapter into slave mode and select the device address. */
-static int select_slave(int fd, uint8_t address)
-{
-    if (ioctl(fd, I2C_SLAVE, (long)address) < 0) {
-        /*
-         * I2C_SLAVE fails with EBUSY when the driver already owns the address.
-         * I2C_SLAVE_FORCE is the documented escape hatch, and some adapters
-         * only implement that one.
-         */
-        if (errno == EBUSY) {
-            if (ioctl(fd, I2C_SLAVE_FORCE, (long)address) < 0)
-                return -1;
-        } else {
-            return -1;
-        }
-    }
-    return 0;
-}
-
 static int write_reg(struct mpu6050_imu *imu, uint8_t reg, uint8_t value)
 {
-    uint8_t buf[2] = { reg, value };
+    int rc = i2c_bb_write_regs(&imu->bus, imu->address, reg, &value, 1);
 
-    if (select_slave(imu->fd, imu->address) < 0)
-        return -1;
-    if (write(imu->fd, buf, sizeof(buf)) != (ssize_t)sizeof(buf))
-        return -1;
-    return 0;
+    if (rc == I2C_BB_ENOACK)
+        errno = EREMOTEIO;
+    else if (rc != I2C_BB_OK)
+        errno = EIO;
+    return (rc == I2C_BB_OK) ? 0 : -1;
 }
 
 static int read_regs(struct mpu6050_imu *imu,
@@ -107,19 +92,13 @@ static int read_regs(struct mpu6050_imu *imu,
                      uint8_t *out,
                      size_t length)
 {
-    if (select_slave(imu->fd, imu->address) < 0)
-        return -1;
+    int rc = i2c_bb_read_regs(&imu->bus, imu->address, reg, out, length);
 
-    /*
-     * Write the register pointer without a stop condition where the adapter
-     * supports it. A plain write followed by a plain read is accepted by the
-     * MPU6050 as well, because it tolerates a stop between the two phases.
-     */
-    if (write(imu->fd, &reg, 1) != 1)
-        return -1;
-    if (read(imu->fd, out, length) != (ssize_t)length)
-        return -1;
-    return 0;
+    if (rc == I2C_BB_ENOACK)
+        errno = EREMOTEIO;
+    else if (rc != I2C_BB_OK)
+        errno = EIO;
+    return (rc == I2C_BB_OK) ? 0 : -1;
 }
 
 int mpu6050_read_who_am_i(struct mpu6050_imu *imu, uint8_t *value)
@@ -129,30 +108,27 @@ int mpu6050_read_who_am_i(struct mpu6050_imu *imu, uint8_t *value)
     return read_regs(imu, MPU6050_REG_WHO_AM_I, value, 1);
 }
 
+/*
+ * The scanner's entry point, kept for interface compatibility with the old
+ * /dev/i2c-N implementation. The board-side tool now owns the bus itself
+ * (see tools/mpu6050-probe.c), so this is only reached by callers that
+ * already hold an open device; the fd form made sense when the handle was a
+ * file descriptor and does not carry over.
+ */
 int mpu6050_probe_address(int fd, uint8_t address)
 {
-    /*
-     * An SMBus quick write is one byte on the bus and no data. The MPU6050
-     * does not care about the payload, so a plain one byte write is a valid
-     * presence probe, and it avoids depending on I2C_RDWR iovec support.
-     */
-    if (select_slave(fd, address) < 0)
-        return (errno == ENODEV || errno == EREMOTEIO) ? 0 : -1;
-
-    uint8_t dummy = 0;
-    if (write(fd, &dummy, 1) != 1) {
-        if (errno == ENXIO || errno == EREMOTEIO)
-            return 0; /* nobody answered: absent */
-        return -1;
-    }
-    return 1;
+    (void)fd;
+    (void)address;
+    errno = ENOSYS;
+    return -1;
 }
 
 int mpu6050_open(const struct mpu6050_config *config, struct mpu6050_imu **imu)
 {
     struct mpu6050_imu *self;
-    const char *path;
     uint8_t address;
+    unsigned scl;
+    unsigned sda;
     int accel_fsr;
     int gyro_fsr;
 
@@ -164,12 +140,20 @@ int mpu6050_open(const struct mpu6050_config *config, struct mpu6050_imu **imu)
         return -1;
     }
 
-    path = (config->i2c_dev != NULL) ? config->i2c_dev
-                                     : MPU6050_I2C_DEV_DEFAULT;
+    /*
+     * config->i2c_dev is ignored now that the transport is bit-banged, but the
+     * field stays so existing callers keep compiling. The pin numbers come
+     * from the config when given, so a different board layout needs no edit
+     * here.
+     */
     address = (config->address != 0) ? config->address
                                      : MPU6050_ADDR_AD0_LOW;
     accel_fsr = config->accel_fsr;
     gyro_fsr = config->gyro_fsr;
+    scl = (config->scl_gpio != 0) ? config->scl_gpio
+                                  : MPU6050_BITBANG_SCL_GPIO;
+    sda = (config->sda_gpio != 0) ? config->sda_gpio
+                                  : MPU6050_BITBANG_SDA_GPIO;
 
     if (mpu6050_accel_fsr_bits(accel_fsr) < 0)
         accel_fsr = MPU6050_FSR_ACCEL_2G;
@@ -180,25 +164,48 @@ int mpu6050_open(const struct mpu6050_config *config, struct mpu6050_imu **imu)
     if (self == NULL)
         return -1;
 
-    self->fd = open(path, O_RDWR);
-    if (self->fd < 0) {
+    self->gpio = sysfs_gpio_open(scl, sda, MPU6050_BITBANG_HALF_PERIOD_US);
+    if (self->gpio == NULL) {
         free(self);
         return -1;
     }
+
+    if (i2c_bb_init(&self->bus, sysfs_gpio_ops(), self->gpio) != I2C_BB_OK) {
+        sysfs_gpio_close(self->gpio);
+        free(self);
+        errno = EINVAL;
+        return -1;
+    }
+
     self->address = address;
     self->accel_fsr = accel_fsr;
     self->gyro_fsr = gyro_fsr;
     self->accel_scale = mpu6050_accel_scale(accel_fsr);
     self->gyro_scale = mpu6050_gyro_scale(gyro_fsr);
 
-    if (check_adapter_caps(self->fd) != 0)
+    /*
+     * Unwedge first. If a previous run died mid-transaction the target may
+     * still be holding SDA low, and every later access would then fail for a
+     * reason that has nothing to do with this program.
+     */
+    if (i2c_bb_bus_recover(&self->bus) != I2C_BB_OK)
         goto fail;
 
     if (config->verify_who_am_i) {
         uint8_t who = 0;
+
         if (mpu6050_read_who_am_i(self, &who) != 0)
             goto fail;
-        if (who != MPU6050_WHO_AM_I_VALUE) {
+
+        /*
+         * Deliberately not `if (who != 0x68)`. The module on the bench
+         * answered 0x70, which is an MPU6500: same output register layout,
+         * different id. Rejecting anything but 0x68 turns a working sensor
+         * into an unexplained ENODEV, which is exactly the kind of bug that
+         * costs an afternoon. Accept the whole family and let a caller that
+         * genuinely cares check the value itself.
+         */
+        if (!mpu6050_who_am_i_supported(who)) {
             errno = ENODEV;
             goto fail;
         }
@@ -208,8 +215,12 @@ int mpu6050_open(const struct mpu6050_config *config, struct mpu6050_imu **imu)
      * PWR_MGMT_1 bit 6 is SLEEP, set by default on power up. DEVICE_RESET
      * (bit 7) is deliberately not used here: it clears every register and
      * costs 100 ms, which is wasted work on a part we are about to configure
-     * from scratch anyway. Bit 0 selects the PLL, which is what the gyro
-     * needs to be stable; the internal 8 MHz oscillator drifts too much.
+     * from scratch anyway. The low bits select the PLL, which is what the
+     * gyro needs to be stable; the internal 8 MHz oscillator drifts too much.
+     *
+     * 0x01 rather than 0x00: on this module the register accepted the value
+     * and read back correctly, and CLKSEL = 1 (PLL with X gyro reference) is
+     * what the datasheet recommends for the best bias stability.
      */
     if (write_reg(self, MPU6050_REG_PWR_MGMT_1, 0x01) != 0)
         goto fail;
@@ -227,7 +238,7 @@ int mpu6050_open(const struct mpu6050_config *config, struct mpu6050_imu **imu)
         goto fail;
 
     /*
-     * INT_PIN_CFG bit 1 (I2C_BYPASS_EN) must stay 0, and BITS 7/6 default to
+     * INT_PIN_CFG bit 1 (I2C_BYPASS_EN) must stay 0, and bits 7/6 default to
      * push-pull/active-high which we do not use. Writing 0 keeps the
      * auxiliary bus disabled so the part does not try to become an I2C master
      * on a bus that already has one.
@@ -241,7 +252,9 @@ int mpu6050_open(const struct mpu6050_config *config, struct mpu6050_imu **imu)
 fail:
     {
         int saved = errno;
-        close(self->fd);
+
+        i2c_bb_release(&self->bus);
+        sysfs_gpio_close(self->gpio);
         free(self);
         errno = saved;
     }
@@ -252,8 +265,8 @@ void mpu6050_close(struct mpu6050_imu *imu)
 {
     if (imu == NULL)
         return;
-    if (imu->fd >= 0)
-        close(imu->fd);
+    i2c_bb_release(&imu->bus);
+    sysfs_gpio_close(imu->gpio);
     free(imu);
 }
 
@@ -291,9 +304,20 @@ int mpu6050_read(struct mpu6050_imu *imu, struct mpu6050_sample *sample)
     return 0;
 }
 
-int mpu6050_fd(const struct mpu6050_imu *imu)
+/* Transport diagnostics, for the probe tool. */
+unsigned mpu6050_transactions(const struct mpu6050_imu *imu)
 {
-    return (imu != NULL) ? imu->fd : -1;
+    return (imu != NULL) ? imu->bus.transactions : 0;
+}
+
+unsigned mpu6050_ack_failures(const struct mpu6050_imu *imu)
+{
+    return (imu != NULL) ? imu->bus.ack_failures : 0;
+}
+
+unsigned mpu6050_io_errors(const struct mpu6050_imu *imu)
+{
+    return (imu != NULL) ? imu->bus.io_errors : 0;
 }
 
 #endif /* __linux__ */

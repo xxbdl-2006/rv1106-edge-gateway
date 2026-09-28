@@ -37,13 +37,15 @@ MEDIA_SRC := src/mpp_encoder.c src/sink_file.c src/sink_queue.c \
 
 # Sensor sources are deliberately NOT part of MEDIA_SRC: nothing in the video
 # pipeline references them yet, so adding them here would only enlarge the
-# board binary without changing behaviour. src/mpu6050.c is host safe; the
-# transport half is empty on non-Linux, which is what lets the test target
-# below list it unconditionally.
-SENSOR_SRC := src/mpu6050.c src/mpu6050_i2c.c
+# board binary without changing behaviour.
+#
+# src/i2c_bitbang.c is host safe: it touches nothing but struct i2c_gpio_ops,
+# which is exactly why the timing can be unit tested with a recording fake.
+# src/gpio_sysfs.c and src/mpu6050_i2c.c are Linux only and compile to nothing
+# elsewhere, which is what lets the test targets list them unconditionally.
+SENSOR_SRC := src/mpu6050.c src/mpu6050_i2c.c src/i2c_bitbang.c src/gpio_sysfs.c
 
 .PHONY: all clean test host-syntax mpu6050-probe
-
 all: v4l2_capture v4l2_mpp_encode
 
 v4l2_capture: src/v4l2_capture.c src/capture_signal.h
@@ -84,24 +86,32 @@ test-capture-thread: tests/test_capture_thread.c src/capture_thread.c \
 	$(HOSTCC) $(TEST_CFLAGS) -o $@ tests/test_capture_thread.c \
 		src/capture_thread.c src/frame_ring.c -lpthread
 
-# Only src/mpu6050.c is compiled here; src/mpu6050_i2c.c is #ifdef __linux__
-# and would contribute nothing. The decoding maths is the part worth testing
-# and the part that is transport independent, which is the whole reason the
-# driver is split in two.
+# Only src/mpu6050.c is compiled here; src/mpu6050_i2c.c and src/gpio_sysfs.c
+# are #ifdef __linux__ and would contribute nothing. The decoding maths is the
+# part worth testing and the part that is transport independent, which is the
+# whole reason the driver is split up.
 test-mpu6050: tests/test_mpu6050.c src/mpu6050.c src/mpu6050.h
 	$(HOSTCC) $(TEST_CFLAGS) -o $@ tests/test_mpu6050.c src/mpu6050.c -lm
 
+# The I2C timing, driven through a recording fake gpio backend. No sysfs, no
+# filesystem, no sleeps: this asserts on the actual edge sequence, which is the
+# only way to catch a master that produces plausible but wrong waveforms.
+test-i2c-bitbang: tests/test_i2c_bitbang.c src/i2c_bitbang.c src/i2c_bitbang.h \
+	src/mpu6050_gpio.h src/mpu6050.c src/mpu6050.h
+	$(HOSTCC) $(TEST_CFLAGS) -o $@ tests/test_i2c_bitbang.c \
+		src/i2c_bitbang.c src/mpu6050.c -lm
+
 test: test-packet-queue test-rtp-rtsp test-frame-ring test-capture-thread \
-	test-mpu6050
+	test-mpu6050 test-i2c-bitbang
 	./test-packet-queue
 	./test-rtp-rtsp
 	./test-frame-ring
 	./test-capture-thread
 	./test-mpu6050
+	./test-i2c-bitbang
 
-# Board side only: cross compiled, talks to /dev/i2c-N.
-mpu6050-probe: tools/mpu6050-probe.c src/mpu6050.c src/mpu6050_i2c.c \
-	src/mpu6050.h
+# Board side only: cross compiled, drives the gpio pins directly.
+mpu6050-probe: tools/mpu6050-probe.c $(SENSOR_SRC) src/mpu6050.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tools/mpu6050-probe.c \
 		$(SENSOR_SRC) $(LDLIBS)
 
@@ -121,11 +131,15 @@ host-syntax: src/rtsp_server.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/capture_thread.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/frame_ring.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/mpu6050.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/i2c_bitbang.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
 		src/mpu6050_i2c.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
+		src/gpio_sysfs.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
 		tools/mpu6050-probe.c
 
 clean:
 	rm -f v4l2_capture v4l2_mpp_encode mpu6050-probe test-packet-queue \
-		test-rtp-rtsp test-frame-ring test-capture-thread test-mpu6050
+		test-rtp-rtsp test-frame-ring test-capture-thread test-mpu6050 \
+		test-i2c-bitbang

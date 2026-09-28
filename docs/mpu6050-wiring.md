@@ -358,20 +358,51 @@ adb shell "python3 /userdata/i2c-bitbang.py --delay 10 scan" # 调快半周期(u
 
 ---
 
-## 7. 代码结构
+## 5. 代码结构（2026-09-21 重构为 bit-bang 传输）
 
 遵循和 RTSP 相同的分层规则 —— **不可测的部分尽量小，可测的部分尽量大**：
 
 | 文件 | 职责 | 能否在 Windows 单测 |
 |---|---|---|
-| `src/mpu6050.h` | 接口、寄存器地址、量程常量 | — |
+| `src/mpu6050.h` | 接口、寄存器地址、量程常量、引脚默认值 | — |
 | `src/mpu6050.c` | **解码数学**：字节序、量纲换算、温度公式 | ✅ 68 项单测 |
-| `src/mpu6050_i2c.c` | **唯一**碰 `/dev/i2c-N` 的文件 | ❌ 只能语法检查 |
-| `tools/mpu6050-probe.c` | 板端扫描/打印工具 | ❌ |
+| `src/mpu6050_gpio.h` | **引脚抽象接口**（开漏语义的 5 个函数指针） | — |
+| `src/i2c_bitbang.c` | **I2C 时序**：START/STOP、位收发、ACK、总线自愈 | ✅ **50 项单测** |
+| `src/gpio_sysfs.c` | **唯一**碰 `/sys/class/gpio` 的文件 | ❌ 只能语法检查 |
+| `src/mpu6050_i2c.c` | MPU6050 寄存器策略（唤醒、量程、DLPF） | ❌ 只能语法检查 |
+| `tools/mpu6050-probe.c` | 板端扫描/识别/打印工具 | ❌ |
+| `tests/test_i2c_bitbang.c` | 时序单测（假 GPIO + 模拟从机） | ✅ |
 | `tests/test_mpu6050.c` | 解码层单测 | ✅ |
 
-**关键设计**：读传感器必须**一次 14 字节突发读取**（`0x3B` 起），
-不能分 6 次读 —— 分开读会让六个轴来自六个不同的时刻，姿态解算直接失真。
+### 为什么时序能单测
+
+关键是把**引脚操作**抽成 `struct i2c_gpio_ops`（`line_low` / `line_release` /
+`line_read` / `delay` / `release_all`），`i2c_bitbang.c` 只调这 5 个函数，
+**不碰文件、不 sleep**。单测塞进一个"录制器"把所有边沿记下来，
+再用一个模拟从机在 SDA 上应答，于是可以断言**真实波形**：
+
+```c
+uint8_t written[8];
+size_t got = decode_written_bytes(&rec, written, sizeof(written));
+CHECK(written[0] == 0xD0);   /* 0x68 << 1 | write */
+CHECK(written[1] == 0x3B);   /* register */
+CHECK(written[2] == 0xD1);   /* 0x68 << 1 | read  <- 读/写位最容易搞错 */
+```
+
+这比"函数返回 0"强得多：一个时序错的 bit-bang 主机**从调用方看完全正常**，
+只在真硅片上一会儿好一会儿坏。
+
+### 关键设计
+
+1. **读传感器必须一次 14 字节突发读取**（`0x3B` 起）。分 6 次读会让六个轴来自
+   六个不同时刻，姿态解算直接失真。
+2. **寄存器指针用 repeated START 而非 STOP**：`S, addr+W, reg, Sr, addr+R, data, P`。
+   MPU6050 两种都吃，但数据手册规定的是重复起始位，有些器件看到 STOP 会重置指针。
+3. **开漏语义**：`line_release` 实现为 `direction=in`（交给上拉），**不是写 1**。
+4. **异常路径必须释放总线**：`read_regs`/`write_regs` 用 `goto out` 统一收尾，
+   失败时调 `i2c_bb_release()`。SCL 卡在低电平会让整条总线永久死掉。
+5. **`i2c_bb_bus_recover()`**：发 9 个时钟 + STOP，救回被从机拽死的总线
+   （`mpu6050_open` 和扫描前各调一次）。
 
 ```c
 /* 一次性读 0x3B..0x48，14 字节 */
@@ -379,9 +410,72 @@ adb shell "python3 /userdata/i2c-bitbang.py --delay 10 scan" # 调快半周期(u
 #define MPU6050_BURST_LEN   14
 ```
 
+### 引脚默认值
+
+```c
+#define MPU6050_SCL_GPIO_DEFAULT 70   /* GPIO2_A6 = 排针 pin 24 */
+#define MPU6050_SDA_GPIO_DEFAULT 71   /* GPIO2_A7 = 排针 pin 14 */
+```
+
+可用 `--scl/--sda` 覆盖，换板子不用改代码。
+
 ---
 
-## 8. 单测抓到的真实 bug（记录）
+## 6. 板端编译与上板验证
+
+**Windows 侧没有 SDK，必须在 VM 里交叉编译**（`/mnt/hgfs/luckfox_share/rv1103`）：
+
+```bash
+cd /mnt/hgfs/luckfox_share/rv1103
+make mpu6050-probe CROSS_COMPILE=arm-rockchip830-linux-uclibcgnueabihf-
+```
+
+**运行前提**：以 root 跑（要写 `/sys/class/gpio/export`），且那两个引脚
+`MUX UNCLAIMED`。`adb shell` 默认就是 root。
+
+```bash
+adb push mpu6050-probe /userdata/
+adb shell "/userdata/mpu6050-probe"                # 扫描
+adb shell "/userdata/mpu6050-probe --dump"         # 扫描 + 读取
+adb shell "/userdata/mpu6050-probe --delay 10 --dump --count 20"
+```
+
+预期输出：
+
+```
+bus: SCL=gpio70  SDA=gpio71  half period=25 us
+scanning 0x08..0x77 for ACKs
+  0x68: present   <- MPU6050-family, AD0 = low
+  22 transaction(s), 0 nack(s), 0 io error(s)
+
+WHO_AM_I = 0x70 (MPU6500)
+           not the 0x68 of a stock MPU6050, but the
+           output registers are layout-compatible
+
+ #  accel[g]            gyro[dps]           temp[C]
+ 0   -0.161  -0.004  +1.049    +4.21  -4.67  -1.83    48.00
+...
+|a| = 1.054 g (expect ~1.000 when the sensor is still)
+```
+
+**三个判据**：
+- `0x68: present` → 通信通了（不是 `0x68` 就不能收，见 §2.5 的兼容族说明）
+- `|a| ≈ 1.000 g` → 量程/标定/字节序全对（地球重力是免费的标准源）
+- `nack(s) = 0` → 时序干净，没有半途丢应答
+
+**诊断线索**：
+- `io error(s)` 在涨 → 引脚写不动：权限、或已被驱动占用
+- `nack(s)` 在涨而 `io error(s) = 0` → 总线能动但没有器件应答：接线/地址/供电
+- `|a|` 明显偏（比如 8.0）→ 量程配置错；但单测已覆盖换算，更可能是硬件
+
+> ⚠️ **`tools/mpu6050-probe.c` 原来有个真 bug**：算合加速度时只做了三轴平方**相加**
+> 就贴上 `|a|` 标签（漏了开方），会把 1.05 报成 1.10 而看着挺合理。
+> 已改为牛顿迭代开方（不开 `-lm`，rootfs 只有 libc 也能链）。
+> 这类错误没单测是发现不了的 —— 它不崩溃，只是安静地给出错数。
+
+---
+
+## 7. 单测抓到的真实 bug（记录）
 
 写测试时抓到一个我自己犯的错，值得记下来：
 
@@ -407,36 +501,60 @@ FAIL tests/test_mpu6050.c:307: sample zeroed on failure, got 9999
 
 ---
 
-## 9. 这个改动会影响线程化测试吗
+## 8. 这个改动会影响线程化测试吗
 
 **不会。零交集。**
 
 | | 线程化改动 | MPU6050 改动 |
 |---|---|---|
-| 文件 | `frame_ring.*`、`capture_thread.*`、`capture_signal.h` | `mpu6050.*`、`mpu6050_i2c.c`、`tools/mpu6050-probe.c` |
-| 数据源 | V4L2 摄像头 NV12 | `/dev/i2c-N` 寄存器 |
+| 文件 | `frame_ring.*`、`capture_thread.*`、`capture_signal.h` | `mpu6050.*`、`i2c_bitbang.*`、`gpio_sysfs.*`、`tools/mpu6050-probe.c` |
+| 数据源 | V4L2 摄像头 NV12 | GPIO2_A6/A7 位翻转 |
 | Makefile | `MEDIA_SRC`（未改动） | 独立的 `SENSOR_SRC` + `mpu6050-probe` 目标 |
 
 `Makefile` 里 MPU6050 的源文件**刻意不放进 `MEDIA_SRC`** ——
 既然视频流水线一行都没引用它们，放进去只会让板端二进制变大，不改变任何行为。
 
-**回归验证**（`make test`，改动前后对比）：
+**唯一会碰到视频流水线的风险点是 GPIO**：本方案只用 gpio70/71（GPIO2_A6/A7），
+与摄像头的 CSI/I2C4（gpio3 那一组）**完全不相干**。实测确认这两个引脚
+`MUX UNCLAIMED`，且**整个 GPIO2 bank 32 个脚都没被占用**。
 
-| 测试 | 改动前 | 改动后 |
+**回归验证**（`make test`，本次重构前后对比）：
+
+| 测试 | 重构前 | 重构后 |
 |---|---|---|
 | test-packet-queue | 43 | 43 ✅ |
 | test-rtp-rtsp | 86 | 86 ✅ |
-| test-frame-ring | 60 | 64 ✅ |
+| test-frame-ring | 64 | 64 ✅ |
 | test-capture-thread | 13 | 13 ✅ |
-| test-mpu6050 | — | **68 新增** |
-| **合计** | **202** | **274** |
+| test-mpu6050 | 68 | 68 ✅ |
+| test-i2c-bitbang | — | **50 新增** |
+| **合计** | **274** | **324** |
 
 **唯一会打断线程化测试的是"改设备树+重刷固件"** —— 那是硬件操作，不是代码改动。
-按第 5 节先只做软件验证，则**完全不打断**。
+本次重构**一行设备树都没碰**，走的是纯用户态 GPIO，所以**完全不打断**。
+
+### 时序单测抓到的三个真 bug（记录）
+
+写 `tests/test_i2c_bitbang.c` 时抓出来的，都值得一提：
+
+1. **`read_byte` 根本没写出读到的值** —— `out` 参数完全没被赋值（`-Wunused-parameter`
+   报出来的）。这意味着所有读操作都会返回调用者栈上的垃圾。**编译器的告警直接抓到，
+   但只有开着 `-Wextra` 才行。**
+2. **测试解码器漏算 ACK 时钟** —— 我最初按"每 8 个 SCL 上升 = 1 字节"解码，
+   但每个字节后还有第 9 个 ACK 时钟。这个时钟被当成下一字节的第 1 位，
+   于是**每个字节都错位一位**。表现是解出 `0xE8` 而不是 `0xD0` 这类"看着像但不对"
+   的值 —— 如果只断言"读到了东西"就永远发现不了。
+3. **START 里的 SCL 上升被误记成数据位** —— START 是"SDA 下降且 SCL 高"，
+   之后 `scl_low` → `scl_release` 会产生一个上升沿，而那时 SDA 还是高，
+   解码器就记了一个 `1` 进去。修法是**在 START/STOP 处重置位计数器**，
+   让解码器对齐帧边界。
+
+**共同教训**：时序类的 bug 不会让程序崩溃，只会让数据"看起来差不多"。
+必须断言**具体的边沿/字节值**，断言"成功"是没有意义的。
 
 ---
 
-## 10. 引脚号速查：别再把 SoC 号当排针号
+## 9. 引脚号速查：别再把 SoC 号当排针号
 
 这次踩坑的根源是两套编号体系混用：
 

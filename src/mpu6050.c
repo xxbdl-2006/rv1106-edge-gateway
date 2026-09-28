@@ -36,6 +36,54 @@ static int16_t read_be16(const uint8_t *p)
     return (int16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
 }
 
+/*
+ * WHO_AM_I values this driver can decode.
+ *
+ * All of these share the output register map the decoder assumes: 0x3B accel,
+ * 0x41 temperature, 0x43 gyro, 16 bit big endian, and the same 16384 LSB/g at
+ * +/-2g. They differ in id, in some control bit masks, and in what else is on
+ * the die (the 9250 has a magnetometer behind its own bypass).
+ *
+ * The distinction that matters in practice: the module on this bench reports
+ * 0x70, an MPU6500, and a driver that only accepted 0x68 would have refused to
+ * open a sensor that reads back perfectly good physics. The list is here so
+ * that decision is explicit rather than accidental.
+ */
+int mpu6050_who_am_i_supported(uint8_t who)
+{
+    switch (who) {
+    case 0x68: /* MPU6050 */
+    case 0x70: /* MPU6500 */
+    case 0x71: /* MPU9250 */
+    case 0x72: /* MPU6515 */
+    case 0x73: /* MPU9255 */
+    case 0x98: /* ICM series and various clones */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+const char *mpu6050_who_am_i_name(uint8_t who)
+{
+    switch (who) {
+    case 0x68:
+        return "MPU6050";
+    case 0x70:
+        return "MPU6500";
+    case 0x71:
+        return "MPU9250";
+    case 0x72:
+        return "MPU6515";
+    case 0x73:
+        return "MPU9255";
+    case 0x98:
+        return "ICM-series or clone";
+    default:
+        return NULL;
+    }
+}
+
 float mpu6050_accel_scale(int accel_fsr)
 {
     switch (accel_fsr) {

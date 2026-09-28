@@ -12,13 +12,25 @@
  *
  *   mpu6050.c     protocol + register decoding. Pure buffer maths, no ioctl,
  *                 no socket, no Linux headers. Builds and tests on Windows.
- *   mpu6050_i2c.c the ONLY file that talks to /dev/i2c-N. One open, two ioctls.
+ *   i2c_bitbang.c I2C timing. No I/O at all: every pin access and every delay
+ *                 goes through struct i2c_gpio_ops, so the host test drives it
+ *                 with a recorder and asserts on the real edge sequence.
+ *   gpio_sysfs.c  the only file that touches /sys/class/gpio. Linux only.
+ *   mpu6050_i2c.c register policy on top of all three. Linux only.
  *
- * The split exists because the interesting part of a sensor driver is the
- * decoding, and the decoding is exactly the part that is painful to test on
- * hardware. Keeping it transport-free means the scaling maths, the sign
- * handling and the big-endian reads are all covered by host unit tests, and
- * the untestable remainder is small enough to eyeball.
+ * The split exists because the interesting parts of a sensor driver are the
+ * decoding and the timing, and those are exactly the parts that are painful to
+ * test on hardware. Keeping both transport-free means the scaling maths, the
+ * sign handling, the big-endian reads and the I2C edge ordering are all
+ * covered by host unit tests, and the untestable remainder is small enough to
+ * eyeball.
+ *
+ * Why not /dev/i2c-N: on the Luckfox Pico Max the i2c3 controller that serves
+ * header pins 24/14 is status = "disabled" in the device tree, so no adapter
+ * node is ever created. The runtime overlay that would flip it does not work
+ * on this board either - see dts/i2c3-enable.dts for the evidence. A disabled
+ * controller never claims its pinctrl, which leaves those pins as ordinary
+ * GPIO and makes userspace bit-banging the practical route.
  *
  * The part is read as one 14 byte burst starting at 0x3B:
  *
@@ -35,7 +47,9 @@
  * consistent sample.
  */
 
-#define MPU6050_I2C_DEV_DEFAULT "/dev/i2c-4"
+/* Default GPIO numbers for the bit-banged bus (header pin 24 SCL / pin 14 SDA). */
+#define MPU6050_SCL_GPIO_DEFAULT 70
+#define MPU6050_SDA_GPIO_DEFAULT 71
 
 /* 7-bit address. AD0 low = 0x68, AD0 high = 0x69. */
 #define MPU6050_ADDR_AD0_LOW  0x68
@@ -50,15 +64,32 @@
 #define MPU6050_REG_PWR_MGMT_1   0x6B
 #define MPU6050_REG_WHO_AM_I     0x75
 
-/* WHO_AM_I is the only way to tell a real part from a floating bus. */
+/*
+ * WHO_AM_I values that share the MPU6050 output register layout.
+ *
+ * 0x68 is the original MPU6050, but modules ship with whatever the assembler
+ * could get. The one on this bench answers 0x70, an MPU6500: identical output
+ * registers, different id. Treating only 0x68 as valid would reject it, so the
+ * whole family is accepted and the exact part is reported rather than enforced.
+ */
 #define MPU6050_WHO_AM_I_VALUE 0x68
+
+/* Non-zero when `who` is a part this driver can decode. */
+int mpu6050_who_am_i_supported(uint8_t who);
+
+/* Human readable model name for a WHO_AM_I value, or NULL if unrecognised. */
+const char *mpu6050_who_am_i_name(uint8_t who);
 
 #define MPU6050_BURST_START MPU6050_REG_ACCEL_XOUT_H
 #define MPU6050_BURST_LEN   14
 
 struct mpu6050_config {
-    /* Path to the i2c adapter, e.g. "/dev/i2c-4". NULL uses the default. */
-    const char *i2c_dev;
+    /*
+     * GPIO numbers of the two bus lines. 0 uses MPU6050_SCL_GPIO_DEFAULT /
+     * MPU6050_SDA_GPIO_DEFAULT, which are header pin 24 and pin 14.
+     */
+    unsigned scl_gpio;
+    unsigned sda_gpio;
     /* 7-bit address, MPU6050_ADDR_AD0_LOW or _HIGH. 0 uses the default. */
     uint8_t address;
     /* Full scale range, one of the MPU6050_FSR_* constants. 0 uses +/-2g. */
@@ -72,8 +103,9 @@ struct mpu6050_config {
     /* DLPF bandwidth, one of the MPU6050_DLPF_* constants. 0 uses 44 Hz. */
     uint8_t dlpf;
     /*
-     * 0 = skip the WHO_AM_I check (useful for clones that misreport it),
-     * non-zero = refuse to open when the part does not answer 0x68.
+     * 0 = skip the WHO_AM_I check, non-zero = refuse to open when the part is
+     * not a recognised member of the family. Note this accepts 0x70 and
+     * friends, not just 0x68; see mpu6050_who_am_i_supported().
      */
     int verify_who_am_i;
 };
@@ -148,19 +180,22 @@ int mpu6050_accel_fsr_bits(int accel_fsr);
 int mpu6050_gyro_fsr_bits(int gyro_fsr);
 
 /* ------------------------------------------------------------------------ */
-/* I2C transport: only implemented on Linux, lives in mpu6050_i2c.c.         */
+/* Transport: only implemented on Linux, lives in mpu6050_i2c.c.             */
 /* ------------------------------------------------------------------------ */
 
 struct mpu6050_imu;
 
 /*
- * Open the bus, wake the part, apply the configured ranges and sample rate.
+ * Open the pins, unwedge the bus, wake the part, apply the configured ranges
+ * and sample rate.
  *
  * Returns 0 on success. On failure returns -1 with errno set; the message is
  * left to the caller's log so this layer stays free of printf.
  *
- * Fails with ENODEV when verify_who_am_i is set and the part does not answer,
- * which is the difference between "wrong address" and "nothing on the bus".
+ * Fails with ENODEV when verify_who_am_i is set and the part does not answer
+ * with a recognised id, which is the difference between "wrong address" and
+ * "nothing on the bus". Fails with ENOMEM when the pins cannot be exported,
+ * usually because something else already claimed them.
  */
 int mpu6050_open(const struct mpu6050_config *config, struct mpu6050_imu **imu);
 
@@ -173,12 +208,15 @@ int mpu6050_read(struct mpu6050_imu *imu, struct mpu6050_sample *sample);
 int mpu6050_read_who_am_i(struct mpu6050_imu *imu, uint8_t *value);
 
 /*
- * Probe a 7-bit address: returns 1 when the address acknowledges, 0 when it
- * does not, -1 on a transport error. Used by the scanner to find the part.
+ * Transport counters, for diagnostics.
+ *
+ * These distinguish failure modes that otherwise look identical from the
+ * caller's side: a bus with transactions climbing and ack_failures flat is
+ * talking to something; one with io_errors climbing cannot even drive the
+ * pins, which points at permissions or a pin already claimed by a driver.
  */
-int mpu6050_probe_address(int fd, uint8_t address);
-
-/* The raw adapter fd, for the scanner in tools/. */
-int mpu6050_fd(const struct mpu6050_imu *imu);
+unsigned mpu6050_transactions(const struct mpu6050_imu *imu);
+unsigned mpu6050_ack_failures(const struct mpu6050_imu *imu);
+unsigned mpu6050_io_errors(const struct mpu6050_imu *imu);
 
 #endif
