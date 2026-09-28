@@ -102,7 +102,7 @@ test-i2c-bitbang: tests/test_i2c_bitbang.c src/i2c_bitbang.c src/i2c_bitbang.h \
 		src/i2c_bitbang.c src/mpu6050.c -lm
 
 test: test-packet-queue test-rtp-rtsp test-frame-ring test-capture-thread \
-	test-mpu6050 test-i2c-bitbang
+	test-mpu6050 test-i2c-bitbang board-flags
 	./test-packet-queue
 	./test-rtp-rtsp
 	./test-frame-ring
@@ -110,10 +110,15 @@ test: test-packet-queue test-rtp-rtsp test-frame-ring test-capture-thread \
 	./test-mpu6050
 	./test-i2c-bitbang
 
+# Includes every target that compiles a file from tools/, which is where the
+# "living in another directory" problem comes from. Files under src/ resolve
+# their quoted includes against their own directory and never need this.
+TOOLS_CPPFLAGS := -Isrc
+
 # Board side only: cross compiled, drives the gpio pins directly.
 mpu6050-probe: tools/mpu6050-probe.c $(SENSOR_SRC) src/mpu6050.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tools/mpu6050-probe.c \
-		$(SENSOR_SRC) $(LDLIBS)
+	$(CC) $(CPPFLAGS) $(TOOLS_CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ \
+		tools/mpu6050-probe.c $(SENSOR_SRC) $(LDLIBS)
 
 # src/rtsp_server.c is the only file that needs POSIX sockets, which MinGW does
 # not provide. src/v4l2_mpp_encode.c cannot be checked here at all because it
@@ -138,6 +143,43 @@ host-syntax: src/rtsp_server.c
 		src/gpio_sysfs.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
 		tools/mpu6050-probe.c
+
+# Check the sensor sources the way the BOARD build compiles them, rather than
+# with the test flags.
+#
+# The concrete bug this was written after: the board rule for mpu6050-probe
+# needs TOOLS_CPPFLAGS for "mpu6050.h" to resolve, because the file lives in
+# tools/ while the header lives in src/. The rule originally had no -I at all.
+# It passed host-syntax and every test on Windows, then failed the first real
+# cross compile with:
+#
+#     tools/mpu6050-probe.c:30:10: fatal error: mpu6050.h: No such file
+#
+# host-syntax could not catch it because that target checks with TEST_CFLAGS,
+# which carries -Isrc. The check and the build disagreed about the flags, so
+# the check was not checking the build.
+#
+# This target references TOOLS_CPPFLAGS and CFLAGS instead of spelling flags
+# out again, so the two cannot drift apart. Verified by mutation: clearing the
+# variable makes this target fail with the same fatal error the board hit,
+# which is the whole point.
+#
+# No claim is made about catching -O2-only warnings. CFLAGS is used as-is for
+# consistency, but -fsyntax-only does not run the optimisation passes that
+# would produce them, so this target does not check for them.
+#
+# The video targets still cannot be checked on this side: they pull
+# linux/videodev2.h and SDK headers that MinGW does not have.
+.PHONY: board-flags
+board-flags:
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(TOOLS_CPPFLAGS) $(CFLAGS) \
+		-Itests/host-stubs -D__linux__ tools/mpu6050-probe.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) \
+		-Itests/host-stubs -D__linux__ src/mpu6050_i2c.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) \
+		-Itests/host-stubs -D__linux__ src/gpio_sysfs.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/mpu6050.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/i2c_bitbang.c
 
 clean:
 	rm -f v4l2_capture v4l2_mpp_encode mpu6050-probe test-packet-queue \

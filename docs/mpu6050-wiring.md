@@ -605,6 +605,40 @@ FAIL tests/test_mpu6050.c:307: sample zeroed on failure, got 9999
 另外，`|a| = 0.000` 这种"过于完美"的结果本身就是可疑信号 ——
 真实的物理量很少精确等于零。
 
+### 第五个：所有主机检查都通过，第一次真编板端就挂了（本轮，VM 里实测）
+
+第一次在 VM 里跑 `verify-mpu6050.sh`，第 2 步交叉编译就失败：
+
+```
+tools/mpu6050-probe.c:30:10: fatal error: mpu6050.h: No such file or directory
+```
+
+`mpu6050.h` 在 `src/`，而 `tools/mpu6050-probe.c` 在 `tools/` ——
+板端的编译规则**没带 `-Isrc`**，所以这个 include 解析不了。
+
+**为什么主机上一切正常**：`host-syntax` 用的是 `TEST_CFLAGS`，而那个变量**带着 `-Isrc`**。
+所以这个文件在 Windows 上通过了所有检查，直到真正交叉编译才暴露。
+
+> **核心教训**：**检查用的标志和真实构建不一致，就等于没检查。**
+> 一个带 `-Isrc` 的语法检查，无法证明一个不带 `-Isrc` 的构建能通过。
+
+**修复**：把 `-Isrc` 抽成 `TOOLS_CPPFLAGS`，板端规则引用它。
+
+**并补上防线**：新增 `make board-flags` —— 用**板端同一套标志变量**（`TOOLS_CPPFLAGS`
++ `CFLAGS`）做语法检查，已加进 `make test` 默认流程。
+
+**变异测试确认有效**：把 `TOOLS_CPPFLAGS` 清空，`board-flags` 立刻报出
+**和 VM 里一字不差的同一个错误**：
+
+```
+tools/mpu6050-probe.c:30:10: fatal error: mpu6050.h: No such file or directory
+mingw32-make: *** [Makefile:177: board-flags] Error 1
+```
+
+顺便解释一个容易困惑的点：**为什么视频流水线的目标（`v4l2_mpp_encode` 等）
+不带 `-Isrc` 也能编过**？因为它们**住在 `src/` 里**，`#include "xxx.h"` 会先找
+**当前源文件所在目录** —— 而头就在同一个目录。`tools/` 下的文件没有这个便利。
+
 ---
 
 ## 8. 这个改动会影响线程化测试吗
@@ -624,19 +658,24 @@ FAIL tests/test_mpu6050.c:307: sample zeroed on failure, got 9999
 与摄像头的 CSI/I2C4（gpio3 那一组）**完全不相干**。实测确认这两个引脚
 `MUX UNCLAIMED`，且**整个 GPIO2 bank 32 个脚都没被占用**。
 
-**回归验证**（`make test`，bit-bang 重构前 / 后 / 本轮加入校准后）：
+**回归验证**（`make test`，bit-bang 重构前 / 后 / 加校准 / 加 board-flags）：
 
-| 测试 | 重构前 | bit-bang 后 | 本轮（+校准） |
-|---|---|---|---|
-| test-packet-queue | 43 | 43 ✅ | 43 ✅ |
-| test-rtp-rtsp | 86 | 86 ✅ | 86 ✅ |
-| test-frame-ring | 64 | 64 ✅ | 64 ✅ |
-| test-capture-thread | 13 | 13 ✅ | 13 ✅ |
-| test-mpu6050 | 68 | 68 ✅ | **105** ✅ |
-| test-i2c-bitbang | — | 50 ✅ | 50 ✅ |
-| **合计** | **274** | **324** | **361** |
+| 测试 | 重构前 | bit-bang 后 | +校准 | 当前 |
+|---|---|---|---|---|
+| test-packet-queue | 43 | 43 ✅ | 43 ✅ | 43 ✅ |
+| test-rtp-rtsp | 86 | 86 ✅ | 86 ✅ | 86 ✅ |
+| test-frame-ring | 64 | 64 ✅ | 64 ✅ | 64 ✅ |
+| test-capture-thread | 13 | 13 ✅ | 13 ✅ | 13 ✅ |
+| test-mpu6050 | 68 | 68 ✅ | **105** ✅ | **105** ✅ |
+| test-i2c-bitbang | — | 50 ✅ | 50 ✅ | 50 ✅ |
+| **合计** | **274** | **324** | **361** | **361** |
+| `board-flags`（语法检查） | — | — | — | **新增** |
 
-> `test-mpu6050` 本轮从 68 涨到 105 的部分，全部是校准相关（见 §2）：
+> `board-flags` 不产生 assert 计数（它只做 `-fsyntax-only`），但它是
+> **唯一用板端标志检查的工具** —— 就是它这样以后不会再出现"主机全过、板端编不过"
+> 的情况（见 §7 第五个 bug）。
+
+> `test-mpu6050` 从 68 涨到 105 的部分，全部是校准相关（见 §2）：
 > 陀螺仪归零、**重力必须保留**、牛顿迭代开方与 libm 一致性、量程不匹配拒绝、
 > 参数与别名校验、温度直通。
 >
