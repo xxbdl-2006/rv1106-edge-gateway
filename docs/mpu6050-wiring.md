@@ -2,7 +2,47 @@
 
 这篇文档解决一个问题：**MPU6050 到底接在哪两根线上**。
 
-结论先说：**不要接 GPIO3_B7 / GPIO3_C0**，那两个脚接不了。要接的是排针的 **pin 24 / pin 25**。
+> ## ⚠️ 2026-09-28 重要更正
+>
+> 本文早期版本给出的「接排针 **pin 24 / pin 25**（SDA=pin24/SCL=pin25）」是**错的**。
+> 那是把 **SoC 引脚号**（i2c4m0 = GPIO2_A0/A1 = SoC pin 64/65）当成了**排针物理编号**。
+>
+> **实测依据**：板子自己的 `/usr/bin/luckfox-config` 里有官方排针图
+> （`luckfox_pico_pro_max_pin_diagram_file()`），逐行数出来的物理引脚如下：
+
+| 物理脚 | 左列（奇数） | 物理脚 | 右列（偶数） |
+|---|---|---|---|
+| 1 | GPIO1_B2 | 2 | VBUS |
+| 3 | GPIO1_B3 | 4 | VSYS |
+| 5 | GND | 6 | GND |
+| 7 | GPIO1_C7 | 8 | 3V3_EN |
+| 9 | GPIO1_C6 | **10** | **3V3_OUT（3.3V 供电）** |
+| 11 | GPIO1_C5 | 12 | NC |
+| 13 | GPIO1_C4 | **14** | **GPIO2_A7 = I2C3_M0_SDA** |
+| 15 | GND | 16 | GND |
+| 17 | GPIO1_D2 (I2C3_M1_SDA) | 18 | GPIO4_C1 |
+| 19 | GPIO1_D3 (I2C3_M1_SCL) | 20 | GPIO4_C0 |
+| 21 | GPIO2_B1 | 22 | RESET |
+| 23 | GPIO1_C0 | **24** | **GPIO2_A6 = I2C3_M0_SCL** |
+| 25 | GND | 26 | GND |
+| 27 | GPIO1_C1 | 28 | GPIO2_A3 |
+| 29 | GPIO1_C2 | 30 | GPIO2_A2 |
+| 31 | GPIO1_C3 | 32 | GPIO2_A1 |
+| 33 | GPIO2_B0 | 34 | GPIO2_A0 |
+| 35 | GND | 36 | GND |
+| 37 | GPIO1_D0 | 38 | GPIO2_A5 |
+| 39 | GPIO1_D1 | 40 | GPIO2_A4 |
+
+（USB 口朝上时，pin 1 在左上角。）
+
+**关键结论**：
+
+1. **排针上现成的 I2C 是 `i2c3m0`，不是 i2c4** —— 位置是 **pin 14 (SDA) / pin 24 (SCL)**。
+2. **排针上的 GPIO2_A0 / GPIO2_A1（pin 34 / pin 32）在官方图里没有 I2C 标注** ——
+   要用 must 改 pinmux，且 `i2c4m0` 会与摄像头抢 i2c4 控制器。
+3. **3.3V 在排针 pin 10**（不是 36，36 是 GND）。
+4. **本固件所有 I2C 控制器只有 i2c4 是 `okay`**，i2c0/1/2/3 在设备树里都是 `disabled`
+   （实测 `/proc/device-tree/i2c@*`）。所以「启用 i2c3」同样要**改设备树 + 重刷固件**。
 
 ---
 
@@ -40,138 +80,127 @@ $ adb shell "ls /sys/bus/i2c/devices/"
 
 ---
 
-## 2. 正确接法：排针 pin 24 / pin 25
+## 2. 推荐接法：用排针上的 i2c3m0（pin 14 / pin 24）
 
-i2c4 有三个复用组，排针上引出的是 **`i2c4m0`**：
-
-| 复用组 | SDA | SCL | 排针引出 |
-|---|---|---|---|
-| `i2c4m0` | GPIO2_A0 (**pin 64**) | GPIO2_A1 (**pin 65**) | ✅ 排针 pin 24 / pin 25 |
-| `i2c4m1` | GPIO1_B2 (pin 50) | GPIO1_B3 (pin 51) | ❌ 未引出 |
-| `i2c4m2` | GPIO3_B7 (pin 119) | GPIO3_C0 (pin 120) | ❌ GPI 脚，摄像头排线专用 |
-
-实测 pin 64 / 65 **完全空闲、未被占用、支持输入输出**：
+RV1106 各 I2C 控制器的复用组（实测 `pinmux-functions`）：
 
 ```
-$ adb shell "cat /sys/kernel/debug/pinctrl/pinctrl-rockchip-pinctrl/pinmux-pins | grep -E 'pin (64|65) '"
-pin 64 (gpio2-0): (MUX UNCLAIMED) (GPIO UNCLAIMED)
-pin 65 (gpio2-1): (MUX UNCLAIMED) (GPIO UNCLAIMED)
+function: i2c0, groups = [ i2c0m0-xfer i2c0m1-xfer i2c0m2-xfer ]
+function: i2c1, groups = [ i2c1m0-xfer i2c1m1-xfer ]
+function: i2c2, groups = [ i2c2m0-xfer i2c2m1-xfer ]
+function: i2c3, groups = [ i2c3m0-xfer i2c3m1-xfer i2c3m2-xfer ]
+function: i2c4, groups = [ i2c4m0-xfer i2c4m1-xfer i2c4m2-xfer ]
+```
+
+`i2c3m0` 实测对应 **pin 70/71 = GPIO2_A6/A7**，在官方排针图里正好是 **物理 pin 24 / pin 14**，
+而且是官方明确标注的 I2C 脚位。交叉验证 —— RV1106 数据手册的引脚复用表里：
+
+```
+107  UART0_RTS_M1/I2S0_SDO2_SDI2/.../I2C3_SCL_M0/.../GPIO2_A6_d
+106  UART0_CTS_M1/I2S0_SDO1_SDI3/.../I2C3_SDA_M0/.../GPIO2_A7
+```
+
+GPIO 编号公式 `pin = bank*32 + group*8 + X` 代入：GPIO2_A6 = 2×32+6 = **70**、
+GPIO2_A7 = 2×32+7 = **71** —— 与 pinmux 实测一致。
+
+实测这四个脚都空闲、支持输入输出：
+
+```
+$ adb shell "cat .../pinmux-pins | grep -E 'pin (70|71) '"
+pin 70 (gpio2-6): (MUX UNCLAIMED) (GPIO UNCLAIMED)
+pin 71 (gpio2-7): (MUX UNCLAIMED) (GPIO UNCLAIMED)
 ```
 
 ### 接线表
 
 | MPU6050 | Luckfox Pico Pro/Max | 说明 |
 |---|---|---|
-| **VCC** | pin 36 `3V3(OUT)` | **必须 3.3V**。MPU6050 的 VDD 耐压 3.4V，接 5V 会烧 |
-| **GND** | pin 3 / 8 / 13 / 18 / 23 / 28 / 33 | 任一 GND 脚 |
-| **SCL** | **pin 25** (GPIO2_A1) | `I2C4_SCL_M0` |
-| **SDA** | **pin 24** (GPIO2_A0) | `I2C4_SDA_M0` |
+| **VCC** | **pin 10** `3V3_OUT` | **必须 3.3V**。MPU6050 的 VDD 耐压 3.4V，接 5V 会烧 |
+| **GND** | pin 6 / 16 / 26 / 36（或 5/15/25/35） | 任一 GND 脚 |
+| **SCL** | **pin 24** = GPIO2_A6 = `I2C3_M0_SCL` | 官方图标注的 I2C 时钟 |
+| **SDA** | **pin 14** = GPIO2_A7 = `I2C3_M0_SDA` | 官方图标注的 I2C 数据 |
 | **AD0** | GND 或悬空 | 接地 → 地址 `0x68`；接 3V3 → `0x69` |
 | **INT** | 不接 | 当前用轮询读取，不需要中断 |
 | **XDA / XCL** | 不接 | 辅助 I2C，用于挂磁力计，本项目不用 |
 
-⚠️ **注意**：`pin 24/25` 在排针丝印上标的是 `UART1_CTS_M1` / `UART1_RTS_M1`。
-这是复用功能，同一时刻只能选一个 —— 用 I2C 就用不了这组 UART1。本项目没用到 UART1，没有冲突。
+⚠️ **为什么不用 i2c4m0**：`i2c4m0`（GPIO2_A0/A1，排针 pin 34/32）与摄像头用的 `i2c4m2`
+是**同一个控制器**的两个引脚出口。切到 m0 → 摄像头排线上的 I2C 断掉 → **摄像头挂**。
+而 i2c3 是**独立控制器**，用了不影响摄像头。
 
 ---
 
-## 3. 改设备树把 i2c4 从 m2 切到 m0
+## 3. 需要改设备树把 i2c3 打开
 
-**这是唯一需要改设备树的地方**，而且必须做 —— 因为当前 `i2c4m2` 占着 GPI 脚，
-`i2c4m0` 的 pin 64/65 还没被 mux 成 i2c 功能，不切过去的话排针上量不到信号。
+本固件实测只有 i2c4 是 `okay`：
 
-在 SDK 的板级 dts 里改 `i2c4` 节点（RV1106 的板级文件通常在
-`<SDK>/sysdrv/source/kernel/arch/arm/boot/dts/rv1106g-luckfox-pico-pro-max.dts`）：
+```
+$ adb shell "for d in /proc/device-tree/i2c@*; do echo \$(basename \$d) \$(cat \$d/status); done"
+i2c@ff310000 status=disabled
+i2c@ff320000 status=disabled
+i2c@ff450000 status=disabled
+i2c@ff460000 status=disabled
+i2c@ff470000 status=okay      <- 这个就是 i2c4
+```
+
+（`ff470000` = i2c4，由 pinmux 输出的 `ff470000.i2c function i2c4` 反证。）
+
+所以要把 i2c3 打开，需要在板级 dts（`<SDK>/sysdrv/source/kernel/arch/arm/boot/dts/rv1106g-luckfox-pico-pro-max.dts`）
+里：
 
 ```dts
-/* 在 &pinctrl 节点下，把 i2c4 的组定义改成 m0 */
 &pinctrl {
-    i2c4 {
-        i2c4m0_xfer: i2c4m0-xfer {
+    i2c3 {
+        i2c3m0_xfer: i2c3m0-xfer {
             rockchip,pins =
-                <2 RK_PA0 3 &pcfg_pull_none_smt>,   /* SDA: GPIO2_A0 */
-                <2 RK_PA1 3 &pcfg_pull_none_smt>;   /* SCL: GPIO2_A1 */
+                <2 RK_PA6 3 &pcfg_pull_none_smt>,   /* SCL: GPIO2_A6 */
+                <2 RK_PA7 3 &pcfg_pull_none_smt>;   /* SDA: GPIO2_A7 */
         };
     };
 };
 
-/* 然后让 i2c4 引用 m0 组 */
+&i2c3 {
+    status = "okay";
+    pinctrl-names = "default";
+    pinctrl-0 = <&i2c3m0_xfer>;
+    clock-frequency = <100000>;    /* 400k 也行，首次调试建议 100k */
+};
+```
+
+⚠️ **改设备树必须重编内核 + 重刷固件**，会打断正在跑的测试。
+
+---
+
+## 4. 不重刷固件的替代路线：用 i2c4m0 临时验证
+
+如果**只调 MPU6050、暂时不管摄像头**，可以切 `i2c4` 到 m0，这样引脚就是排针的
+**pin 34 (SDA) / pin 32 (SCL)**（注意：这两个脚在官方图里**没有** I2C 标注，
+是 i2c4m0 的复用出口，需要改 dts 才会变成 I2C 功能）：
+
+```dts
 &i2c4 {
     status = "okay";
     pinctrl-names = "default";
     pinctrl-0 = <&i2c4m0_xfer>;    /* 原来是 &i2c4m2_xfer */
-    clock-frequency = <100000>;    /* 400k 也行，但首次调试建议 100k */
+    clock-frequency = <100000>;
 };
 ```
 
-⚠️ **注意两点**：
-
-1. **改了 pinmux 会不会影响摄像头？** 不会。摄像头挂在 i2c4m2 的**线上**，
-   但 m2 和 m0 是**同一控制器的不同引脚出口**。切到 m0 之后，
-   **摄像头排线上的 I2C 就没信号了，摄像头会挂**。所以：
-   - 如果你要**同时**用摄像头和 MPU6050 → **不能切**，得把 MPU6050 也接到摄像头排线上（不现实），
-     或者用别的空闲 I2C 控制器（如 i2c3，见第 4 节）。
-   - 如果只是**单独调试 MPU6050** → 切过去没问题。
-
-2. **改设备树必须重编内核 + 重刷固件**，会打断正在跑的测试。所以：
-
----
-
-## 4. 更推荐：不动设备树，用别的空闲 I2C
-
-既然改 dts 代价大又要重刷，先看有没有别的空闲控制器。查一遍：
-
-```bash
-adb shell "cat /sys/kernel/debug/pinctrl/pinctrl-rockchip-pinctrl/pinmux-functions | grep i2c"
-```
-
-RV1106 的 i2c0/1/2/3 在板上多数未启用，其中 **i2c3 的 `i2c3m0`**
-（pin 29 = `I2C3_SCL_M0`、pin 34 = `I2C3_SDA_M0`）在排针上是现成的，
-设备树里 `status` 设成 `okay` 即可，不必碰 i2c4，也就**完全不影响摄像头**。
-
-先确认这两个脚是不是空闲的：
-
-```bash
-adb shell "cat /sys/kernel/debug/pinctrl/pinctrl-rockchip-pinctrl/pinmux-pins | grep -E 'pin (100|101|102|103|104|105|106|107) '"
-```
-
-（GPIO2_A6 = pin 70，GPIO2_A7 = pin 71 —— 具体号以实测输出为准。）
+**注意**：这与摄像头**互斥** —— 切过去摄像头就没 I2C 了。
 
 **决策建议**：
 
-| 场景 | 方案 |
-|---|---|
-| 只想先把 MPU6050 调通，摄像头暂时不用 | 改 i2c4 → m0，重编重刷 |
-| 摄像头和 MPU6050 都要用 | 启用 i2c3（排针 pin 29/34），i2c4 原样不动 |
-| 不想重刷固件 | **用下面第 5 节的软件位操作**，暂时验证 |
+| 场景 | 方案 | 是否重刷 |
+|---|---|---|
+| 摄像头和 MPU6050 都要用 | 启用 **i2c3**（排针 pin 14/24） | 需重刷 |
+| 只调 MPU6050，摄像头暂时不用 | i2c4 切 m0（排针 pin 34/32） | 需重刷 |
+| 先验证软件逻辑，不动硬件 | 见第 5 节，先跑 `mpu6050-probe` 看"总线上什么都没有" | 不需要 |
 
 ---
 
-## 5. 不重刷固件的临时验证法（软件手动 mux）
-
-内核启动后，用寄存器直接改 pinmux 也能让 pin 64/65 变成 I2C 功能。
-既然当前 i2c4 控制器已经 `okay`，只要**把这两个脚 mux 到 i2c 功能**，
-就能直接在排针上测到信号：
-
-```bash
-# 需要 root（板端默认就是 root）
-# GPIO2_A0/A1 的 iomux：GPIO2 IOC 块 + iomux 偏移
-# RV1106 GPIO2 的 m0 复用值是 3
-```
-
-⚠️ 这属于**非正规做法**：寄存器地址随内核版本变化，且会与 pinctrl 子系统打架。
-**不建议作为长期方案**，但作为"接好线先确认传感器活着"的验证手段可以接受。
-
-**更省事的替代**：先不切引脚，直接用 **i2c4 现有的 m2 总线**验证代码逻辑 ——
-把 MPU6050 的 SDA/SCL **临时点焊到摄像头 FPC 座的对应脚上**（很考验手工），
-或者**先只验证软件**（见下）。
-
----
-
-## 6. 先验证软件，再动硬件
+## 5. 先验证软件，再动硬件
 
 即使一根线没接，程序也应该**干净地报告"总线上什么都没有"**，而不是崩溃或挂死。
-这是可以先做的事：
+这是可以先做的事（**现在就能做，不用重刷**）：
 
 ```bash
 # 交叉编译探测工具
@@ -205,7 +234,7 @@ scanning bus for ACKs (0x08..0x77)...
 
 ---
 
-## 7. 接好线之后的验证步骤
+## 6. 接好线之后的验证步骤
 
 ```bash
 # 1. 扫描确认 0x68 出现
@@ -234,7 +263,7 @@ WHO_AM_I = 0x68 (expect 0x68)
 
 ---
 
-## 8. 代码结构
+## 7. 代码结构
 
 遵循和 RTSP 相同的分层规则 —— **不可测的部分尽量小，可测的部分尽量大**：
 
@@ -257,7 +286,7 @@ WHO_AM_I = 0x68 (expect 0x68)
 
 ---
 
-## 9. 单测抓到的真实 bug（记录）
+## 8. 单测抓到的真实 bug（记录）
 
 写测试时抓到一个我自己犯的错，值得记下来：
 
@@ -283,14 +312,14 @@ FAIL tests/test_mpu6050.c:307: sample zeroed on failure, got 9999
 
 ---
 
-## 10. 这个改动会影响线程化测试吗
+## 9. 这个改动会影响线程化测试吗
 
 **不会。零交集。**
 
 | | 线程化改动 | MPU6050 改动 |
 |---|---|---|
 | 文件 | `frame_ring.*`、`capture_thread.*`、`capture_signal.h` | `mpu6050.*`、`mpu6050_i2c.c`、`tools/mpu6050-probe.c` |
-| 数据源 | V4L2 摄像头 NV12 | `/dev/i2c-4` 寄存器 |
+| 数据源 | V4L2 摄像头 NV12 | `/dev/i2c-N` 寄存器 |
 | Makefile | `MEDIA_SRC`（未改动） | 独立的 `SENSOR_SRC` + `mpu6050-probe` 目标 |
 
 `Makefile` 里 MPU6050 的源文件**刻意不放进 `MEDIA_SRC`** ——
@@ -308,4 +337,22 @@ FAIL tests/test_mpu6050.c:307: sample zeroed on failure, got 9999
 | **合计** | **202** | **274** |
 
 **唯一会打断线程化测试的是"改设备树+重刷固件"** —— 那是硬件操作，不是代码改动。
-如果按第 4 节启用 i2c3，或先只做软件验证（第 6 节），则**完全不打断**。
+按第 5 节先只做软件验证，则**完全不打断**。
+
+---
+
+## 10. 引脚号速查：别再把 SoC 号当排针号
+
+这次踩坑的根源是两套编号体系混用：
+
+| 编号体系 | 例子 | 用途 |
+|---|---|---|
+| **SoC 引脚号** | `pin 64`、`pin 65`、`pin 119` | `/sys/kernel/debug/pinctrl/*`、设备树、内核日志 |
+| **排针物理号** | `pin 14`、`pin 24`、`pin 10` | **你手里要插的孔** |
+
+换算：`SoC 号 = bank*32 + group*8 + X`（GPIO2_A6 → 2×32+6 = 70）。
+排查 pinmux 时用的是 SoC 号；**接线只看排针物理号**。
+
+> 验证手法：板端 `/usr/bin/luckfox-config` 里自带官方排针图，直接
+> `sed -n '/luckfox_pico_pro_max_pin_diagram_file/,/^}/p' /usr/bin/luckfox-config`
+> 就能打印出来，比翻 wiki 快且不会过期。
