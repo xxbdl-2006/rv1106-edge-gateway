@@ -114,8 +114,21 @@ test-sensor: tests/test_sensor.c src/sensor_ring.c src/sensor_ring.h \
 		src/sensor_ring.c src/sensor_attitude.c src/mock_sensor.c \
 		-lpthread -lm
 
+# The OSD layer: font, canvas, formatter and telemetry. None of it touches the
+# SDK, Linux or a socket - which is the point of building the overlay on a
+# separate canvas and compositing it in one place. The whole layer is exercised
+# against synthetic frames here, including the glyph shapes, because a
+# transposed font entry renders as plausible but wrong pixels that nothing else
+# in the system would catch.
+test-osd: tests/test_osd.c src/osd_font.c src/osd_font.h src/osd_overlay.c \
+	src/osd_overlay.h src/osd_format.c src/osd_format.h \
+	src/osd_telemetry.c src/osd_telemetry.h src/sensor_source.h
+	$(HOSTCC) $(TEST_CFLAGS) -o $@ tests/test_osd.c \
+		src/osd_font.c src/osd_overlay.c src/osd_format.c \
+		src/osd_telemetry.c
+
 test: test-packet-queue test-rtp-rtsp test-frame-ring test-capture-thread \
-	test-mpu6050 test-i2c-bitbang test-sensor board-flags
+	test-mpu6050 test-i2c-bitbang test-sensor test-osd board-flags
 	./test-packet-queue
 	./test-rtp-rtsp
 	./test-frame-ring
@@ -123,6 +136,7 @@ test: test-packet-queue test-rtp-rtsp test-frame-ring test-capture-thread \
 	./test-mpu6050
 	./test-i2c-bitbang
 	./test-sensor
+	./test-osd
 
 # Includes every target that compiles a file from tools/, which is where the
 # "living in another directory" problem comes from. Files under src/ resolve
@@ -154,6 +168,10 @@ host-syntax: src/rtsp_server.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/sensor_ring.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/sensor_attitude.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/mock_sensor.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/osd_font.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/osd_overlay.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/osd_format.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/osd_telemetry.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
 		src/mpu6050_i2c.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
@@ -200,8 +218,12 @@ board-flags:
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/sensor_ring.c
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/sensor_attitude.c
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/mock_sensor.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/osd_font.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/osd_overlay.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/osd_format.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/osd_telemetry.c
 
 clean:
 	rm -f v4l2_capture v4l2_mpp_encode mpu6050-probe test-packet-queue \
 		test-rtp-rtsp test-frame-ring test-capture-thread test-mpu6050 \
-		test-i2c-bitbang test-sensor
+		test-i2c-bitbang test-sensor test-osd
