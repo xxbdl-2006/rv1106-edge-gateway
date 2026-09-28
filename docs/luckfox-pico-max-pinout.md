@@ -143,3 +143,52 @@ for d in /proc/device-tree/i2c@*; do echo "$d: $(cat $d/status 2>/dev/null)"; do
 否则 `/dev/i2c-3` 不存在、扫描不到。
 
 参见 [`mpu6050-wiring.md`](./mpu6050-wiring.md)。
+
+---
+
+## 附录：外部引脚图核对（2026-09-28）
+
+用户提供了一张店铺/第三方绘制的引脚图。**核对结论：40 个引脚的名称与复用功能
+全部与官方三源一致，可以放心使用。**
+
+### 核对方法（三源交叉）
+
+| 源 | 说明 |
+|---|---|
+| **A 店铺图** | 用户提供的彩色引脚图 |
+| **B 板端官方图** | `luckfox-config` 内嵌的 `luckfox_pico_pro_max_pin_diagram_file()` |
+| **C 原理图** | `Luckfox-Pico-Pro-Max.pdf` 的 U3 排针符号 + U1B mux 表 |
+
+### 结果
+
+- **40/40 引脚名称完全一致**（GPIO1_B2 … GPIO2_A4），无一处错位。
+- **复用功能标注一致**，且店铺图比板端官方图**更全**：
+  - 板端图 pin 1/3 只写 `FIQtty_TX`/`FIQtty_RX`（那是内核 fiq-debugger 占用的名字）；
+    店铺图写的 `UART2_TX_M1`/`UART2_RX_M1` 才是 **RV1106 数据手册里的复用功能名**。
+    查原理图 mux 表证实：`UART2_TX_M1 ← GPIO1_B2`、`UART2_RX_M1 ← GPIO1_B3`。**店铺图对。**
+  - 板端图 pin 23 标注 `SPI0_M0_CS0`，与店铺图的 `SPI0_CS0_M0` 是**同一个功能的两种写法**。
+  - 板端图 pin 32/34 完全没标 I2C，店铺图标了 `I2C4_SCL_M0`/`I2C4_SDA_M0` ——
+    原理图 mux 表证实 `I2C4_SCL_M0 ← GPIO2_A1`、`I2C4_SDA_M0 ← GPIO2_A0`。**店铺图对。**
+- **板载 LED 标注 `GPIO3_C6_d` 已验证为真**：实测 device tree
+  `leds/work/gpios = <0x33 0x16 0x0>`，而 `gpio3` (ff550000) 的 `phandle = 0x33`、
+  pin `0x16 = 22` → `bank3 + C6` = **GPIO3_C6**，对应 `/sys/class/leds/work`。
+
+### 需要注意的两点
+
+1. **店铺图也是「USB 朝上、pin 1 左上」的朝向**，与官方一致。**但实板排针的 pin 1
+   定义仍建议以板端丝印为准**（画错朝向是最容易犯的错）。
+2. **复用功能名带 `_M0/_M1/_M2` 后缀，是 mux 档位，不是引脚号。**
+   例如 `I2C3_SDA_M0` 和 `I2C3_SDA_M1` 是**同一个 I2C3 控制器的两种引脚出口**：
+   - `I2C3_M0` → pin 24 (SCL) / pin 14 (SDA)  ✅ 本固件推荐
+   - `I2C3_M1` → pin 19 (SCL) / pin 17 (SDA)
+
+   接 MPU6050 用 **M0**（pin 24/14），别看成 M1。
+
+3. 店铺图**没有**标注 `I2C2`、`EMMC`、`VO_LCDC` 等功能 —— 它只画了「用户可用」的复用项，
+   不是遗漏。完整 mux 表见原理图 U1B 符号。
+
+### 最终结论
+
+**这张店铺图是准确的，可以照着接线。** MPU6050 仍按
+`VCC→pin 10 / GND→pin 6或16 / SCL→pin 24 / SDA→pin 14`，
+**前提是先把设备树里的 i2c3 打开**（本固件 i2c0/1/2/3 全 `disabled`，只有 i2c4 是 `okay`）。
