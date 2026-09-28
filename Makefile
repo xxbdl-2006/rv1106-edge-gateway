@@ -101,14 +101,28 @@ test-i2c-bitbang: tests/test_i2c_bitbang.c src/i2c_bitbang.c src/i2c_bitbang.h \
 	$(HOSTCC) $(TEST_CFLAGS) -o $@ tests/test_i2c_bitbang.c \
 		src/i2c_bitbang.c src/mpu6050.c -lm
 
+# The sensor data plane: source interface, ring, attitude solver, mock source.
+# Nothing here needs Linux or a board, which is the point of the layering - the
+# OSD and alarm logic above this can be built and tested before the hardware is
+# even powered. -lm is for the test's own fabsf, not for the code under test:
+# the production files carry their own square root and trig precisely because
+# the rootfs has no libm.
+test-sensor: tests/test_sensor.c src/sensor_ring.c src/sensor_ring.h \
+	src/sensor_source.h src/sensor_attitude.c src/sensor_attitude.h \
+	src/sensor_math.h src/mock_sensor.c src/mock_sensor.h
+	$(HOSTCC) $(TEST_CFLAGS) -o $@ tests/test_sensor.c \
+		src/sensor_ring.c src/sensor_attitude.c src/mock_sensor.c \
+		-lpthread -lm
+
 test: test-packet-queue test-rtp-rtsp test-frame-ring test-capture-thread \
-	test-mpu6050 test-i2c-bitbang board-flags
+	test-mpu6050 test-i2c-bitbang test-sensor board-flags
 	./test-packet-queue
 	./test-rtp-rtsp
 	./test-frame-ring
 	./test-capture-thread
 	./test-mpu6050
 	./test-i2c-bitbang
+	./test-sensor
 
 # Includes every target that compiles a file from tools/, which is where the
 # "living in another directory" problem comes from. Files under src/ resolve
@@ -137,6 +151,9 @@ host-syntax: src/rtsp_server.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/frame_ring.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/mpu6050.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/i2c_bitbang.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/sensor_ring.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/sensor_attitude.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/mock_sensor.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
 		src/mpu6050_i2c.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
@@ -180,8 +197,11 @@ board-flags:
 		-Itests/host-stubs -D__linux__ src/gpio_sysfs.c
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/mpu6050.c
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/i2c_bitbang.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/sensor_ring.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/sensor_attitude.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/mock_sensor.c
 
 clean:
 	rm -f v4l2_capture v4l2_mpp_encode mpu6050-probe test-packet-queue \
 		test-rtp-rtsp test-frame-ring test-capture-thread test-mpu6050 \
-		test-i2c-bitbang
+		test-i2c-bitbang test-sensor
