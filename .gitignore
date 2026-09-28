@@ -19,3 +19,5 @@
 *.core
 core
 core.*
+datasheets/
+*.exe
