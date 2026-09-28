@@ -361,7 +361,8 @@ powercfg /change hibernate-timeout-ac 0
    为 OSD 与磁盘写入留出了头寸。
 2. Mock Sensor → OSD → 真实 MPU6050。
 3. **✅ `S99gateway restart` 白等 20 秒已修复**（见 §7），并顺带修掉了
-   `LD_LIBRARY_PATH` 每次重启重复追加、以及 Windows 检出导致的 CRLF shebang 两个问题。
+   `LD_LIBRARY_PATH` 重复追加（`S99gateway` 与 `gateway-supervise.sh` **两处都有**）、
+   以及 Windows 检出导致的 CRLF shebang 问题。
 
 ---
 
@@ -420,6 +421,8 @@ restart  12:01:32 start requested
 
 ### 实测结果
 
+**restart 场景**（rkipc 不在，即原 bug 的触发条件）：
+
 | | 修复前 | 修复后 |
 | --- | --- | --- |
 | `restart` 命令返回 | ~25s | **5s** |
@@ -427,7 +430,27 @@ restart  12:01:32 start requested
 | boot log 关键字 | `rkipc never appeared in 20s` | `no rkipc, nothing is initialising the camera, proceeding` |
 | 重启后推流 | — | **241 帧 / 8.03s / 30fps / 无误** |
 
-### 顺带修掉的两个问题
+**开机场景**（rkipc **正在推流**，2026-09-28 上板复测）：
+
+```
+14:07:40 start requested
+14:07:40 takeover started, LD_LIBRARY_PATH=[/oem/usr/lib:/oem/lib]
+14:07:40 /userdata is ready
+14:07:40 rkipc is present, waiting for it to open /dev/video11
+14:07:40 rkipc is streaming, taking the camera over     ← 读到 rkipc 已在推流，立刻接管
+14:07:41 rkipc pids before: [845]
+14:07:43 rkipc is gone
+14:07:46 3A server running as 3771
+14:07:48 gateway is up, supervisor pid 3785             ← 全程 8 秒
+```
+
+这条分支是**首次实测**（此前只验证过 rkipc 不存在的路径），确认「rkipc 存在且已在推流」
+时不会多等：判据立刻成立并接管。两条分支自此都上板跑通。
+
+复测推流：**301 帧 / 10.03s / 30fps / 无误**，`Threads: 6`，
+`/dev/video11` 唯一占用者是网关自己。
+
+### 顺带修掉的三个问题
 
 **（1）`LD_LIBRARY_PATH` 每次重启重复追加。**
 `RkEnv.sh` 内容是 `export LD_LIBRARY_PATH=$HOME/usr/lib:$HOME/lib:$LD_LIBRARY_PATH`
@@ -443,11 +466,48 @@ LD_LIBRARY_PATH=/oem/usr/lib:/oem/lib:/oem/usr/lib:/oem/lib:/oem/usr/lib:/oem/li
 修法不是跳过 source（这些路径确实要用），而是 source 之后**去重**：保留每项首次出现
 的顺序，丢掉重复项。实测连续 restart 三次，值稳定在 `/oem/usr/lib:/oem/lib` 不再增长。
 
+**同一个 bug 在 `gateway-supervise.sh` 里还有一份**（2026-09-28 补修）。
+上板复查时发现一个反常现象：**supervisor 的环境是干净的，但它拉起的 encoder 是双份的**。原因是
+链路上有三层都会 source `RkEnv.sh`：
+
+| 层 | 继承到的值 | 自己 source 后 |
+| --- | --- | --- |
+| `adb shell`（登录 profile） | — | 已经是双份 |
+| `S99gateway` | 双份 | 去重 → **单份** |
+| `gateway-supervise.sh` | 单份 | 又前置一份 → **双份** |
+| `v4l2_mpp_encode` | 双份 | — |
+
+所以只修 `S99gateway` 不够：它把值擦干净了，下一层立刻又加上一份。
+`gateway-supervise.sh` 里是**一模一样的 `GATEWAY_ENV_LOADED` 守卫**，同样是跨进程无效。
+现在两处都用同一个 `dedup_path()`，实测 supervisor 与 encoder 的值**都是干净的
+`/oem/usr/lib:/oem/lib`**，逐层归位。
+
+> 顺带一个观察：`adb shell` 自己进出的 `LD_LIBRARY_PATH` **本来就是双份的**（adbd 的登录
+> 环境会 source 两遍）。所以以后看到双份不要立刻当成 bug —— 但要确认**它有没有继续往上涨**，
+> 那才是问题所在。
+
+### 另一个教训：`adb push` 被掉线打断会留下 0 字节文件
+
+USB 掉线时正在进行的那次 `adb push` 会**写一半就断**，在板端留下一个 **0 字节**的
+`/etc/init.d/S99gateway`。它有两层危害：
+
+1. 下次开机 `S99gateway` 是个空文件 → **什么都没启动**（本次实测：板子重启后
+   `v4l2_mpp_encode`/`gateway-supervise`/`rkaiq_3A_server` 全无，只剩 rkipc）；
+2. 文件**存在于 `ls` 里**，所以排查时容易先怀疑「脚本逻辑错」而不是「文件是空的」。
+
+**根文件系统是 ext4（可写）**，所以 `/etc` 的改动**会跨重启保留** —— 这一点也意味着
+一次被截断的推送不会自己恢复。推送后核对字节数是必须的：
+`wc -c < /etc/init.d/S99gateway` 应与本地一致。
+
 **（2）Windows 检出导致 CRLF shebang，脚本"not found"。**
 `scripts/S99gateway` 在工作区被写成 CRLF，`adb push` 原样送到板端后，内核把 shebang
 读成 `#!/bin/sh\r`，去执行一个名为 `/bin/sh` + CR 的解释器，于是报
 `/bin/sh: /etc/init.d/S99gateway: not found` —— 报的是"文件找不到"，而文件明明在，
 极具误导性。
+
+> ⚠️ 判断行尾**不能用 Git Bash 的 `grep -c $'\r'`，它会漏报**（shell 层就把 CR 吃掉了，
+> 回报 0）。必须用 `od -c file | grep -o '\\r' | wc -l`。我一开始正是用 grep 判定
+> 「文件是 LF」，结论完全错误。
 
 注意这个坑**本仓库已经埋好了防线但没覆盖到它**：`.gitattributes` 里有 `*.sh text eol=lf`，
 而 `S99gateway` **没有 `.sh` 后缀**，所以规则没管到它。已补上显式规则：

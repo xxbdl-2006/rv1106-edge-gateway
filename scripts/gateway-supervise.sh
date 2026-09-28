@@ -17,10 +17,35 @@
 # The gateway links the Rockit libraries out of /oem/usr/lib, which are only
 # reachable through LD_LIBRARY_PATH. Pick it up no matter how this script was
 # started, so the encoder cannot fail with a missing shared library.
-if [ -z "$GATEWAY_ENV_LOADED" ] && [ -f /etc/profile.d/RkEnv.sh ]; then
+#
+# RkEnv.sh prepends "$HOME/usr/lib:$HOME/lib:" rather than assigning, so
+# sourcing it again on top of an inherited value duplicates the prefix. That
+# used to be guarded by GATEWAY_ENV_LOADED, which cannot work: the flag would
+# have to survive into this process, and this is started by the init script as
+# a separate process that does not export it. Every layer that sources RkEnv
+# therefore adds another copy, and the encoder -- two layers down -- ends up
+# with the duplication it inherits plus the one added here.
+#
+# The paths are needed, so sourcing stays; the value is de-duplicated after.
+dedup_path() {
+    _in="$1"
+    _out=""
+    _old_ifs="$IFS"
+    IFS=':'
+    for _p in $_in; do
+        case ":$_out:" in
+            *":$_p:"*) ;;
+            *) _out="${_out:+$_out:}$_p" ;;
+        esac
+    done
+    IFS="$_old_ifs"
+    echo "$_out"
+}
+
+if [ -f /etc/profile.d/RkEnv.sh ]; then
     . /etc/profile.d/RkEnv.sh
-    GATEWAY_ENV_LOADED=1
-    export GATEWAY_ENV_LOADED
+    LD_LIBRARY_PATH="$(dedup_path "$LD_LIBRARY_PATH")"
+    export LD_LIBRARY_PATH
 fi
 
 ENV_FILE="/userdata/gateway.env"
