@@ -278,8 +278,9 @@ make CROSS_COMPILE=arm-rockchip830-linux-uclibcgnueabihf-
 ### 主机自测（Windows / Linux 均可）
 
 ```bash
-make test          # 四个套件，共 206 项检查
-make host-syntax   # MinGW 下对含 socket 的文件做语法检查
+make test          # 九个套件，共 1206 项检查 + 两项标志检查
+make host-syntax   # MinGW 下对含 socket / V4L2 的文件做语法检查
+make board-flags   # 同上，但用板端的 CPPFLAGS/CFLAGS
 ```
 
 | 套件 | 检查数 | 覆盖内容 |
@@ -288,14 +289,29 @@ make host-syntax   # MinGW 下对含 socket 的文件做语法检查
 | `test-rtp-rtsp` | 86 | RTP 打包、SDP、请求解析 |
 | `test-frame-ring` | 64 | 帧环顺序、覆盖最旧、生产者消费者并发 |
 | `test-capture-thread` | 13 | 采集成帧、warmup 过滤、故障停机、stop 不挂起 |
+| `test-mpu6050` | 105 | 寄存器编解码、标定、量程换算 |
+| `test-i2c-bitbang` | 50 | 时序边沿序列（录制式 GPIO 假后端） |
+| `test-sensor` | 667 | 数学、姿态、mock、sample ring、接口贯通 |
+| `test-osd` | 143 | 点阵字体、定点格式化、1bpp 画布、遥测行 |
+| `test-osd-pipeline` | 39 | 采样节奏、陈旧样本、速率窗口、annotate 只写副本 |
 
-合计 **206 项，0 失败**。
+合计 **1206 项，0 失败**；`board-flags` 与 `host-syntax-can-fail` 另计。
 
 ### MinGW 限制
 
-`src/v4l2_capture.c` 和 `src/v4l2_mpp_encode.c` 依赖 `linux/videodev2.h`，MinGW
-不提供，**只能在虚拟机里检查**。可主机测试的逻辑都抽到了 `frame_ring.c` 和
-`capture_thread.c`。桩文件说明见 `tests/host-stubs/README.md`。
+`src/v4l2_capture.c` 与 `src/v4l2_mpp_encode.c` 依赖 `linux/videodev2.h`，MinGW
+**整个 include 树里都没有任何 Linux 内核头**。过去这两个文件只能在虚拟机里检查，
+因此编码器（所有集成的落点）的每次改动在主机侧都是「盲改」。
+
+现在 `tests/host-stubs/linux/videodev2.h` 按其**实际用到的符号**补齐了声明，
+配合 `-D__linux__ -include extra.h`，`make host-syntax` / `make board-flags`
+可以对它做零告警语法检查。该桩**只声明用到的名字**（猜全量会接受真实头文件会拒绝的
+代码）、**不建模 ABI**、绝不用于链接或运行。
+
+`make host-syntax-can-fail` 是这两个目标的**体检**：复制一份编码器、把一个结构体
+成员写错，断言编译器必须拒绝。桩文件若哪天与源码脱节，前两个目标会一边打印成功一边
+什么都不查——一个不会变红的绿灯比没有检查更糟，因为它会被信任。该目标一旦失败，
+在修好桩文件之前不要相信另外两个。
 
 ---
 

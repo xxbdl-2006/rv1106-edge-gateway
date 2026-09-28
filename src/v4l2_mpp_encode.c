@@ -13,9 +13,13 @@
 
 #include "capture_thread.h"
 #include "frame_ring.h"
+#include "mock_sensor.h"
 #include "mpp_encoder.h"
+#include "osd_annotate.h"
+#include "osd_feed.h"
 #include "packet_queue.h"
 #include "rtsp_server.h"
+#include "sensor_source.h"
 #include "sink_file.h"
 #include "sink_queue.h"
 
@@ -37,7 +41,29 @@
 #define ENC_DEFAULT_RTSP_PORT 8554U
 #define ENC_DEFAULT_RTSP_PATH "/live/0"
 #define ENC_DEFAULT_RING_SLOTS 4U
-#define ENC_BUILD_TAG "rockit-venc-v23"
+#define ENC_BUILD_TAG "rockit-venc-v24"
+
+/*
+ * Where the overlay lands, in frame pixels. Top left with a small margin is the
+ * convention every camera OSD uses, and it is the corner least likely to cover
+ * whatever the camera is actually pointed at.
+ */
+#define ENC_OSD_ORIGIN_X 8U
+#define ENC_OSD_ORIGIN_Y 8U
+#define ENC_OSD_PADDING 2U
+
+/*
+ * What the overlay shows with no sensor attached.
+ *
+ * The mock defaults to its wave mode rather than level, because a level board
+ * and a broken sensor both read as a fixed "0.0" and the overlay exists partly
+ * to tell those apart. A moving trace proves at a glance that the whole data
+ * path is live, which a still one cannot.
+ */
+#define ENC_OSD_DEFAULT_SOURCE "mock"
+#define ENC_OSD_DEFAULT_MODE "wave"
+#define ENC_OSD_DEFAULT_AMPLITUDE 30U
+#define ENC_OSD_DEFAULT_PERIOD 300U
 
 struct encode_options {
     const char *device;
@@ -54,6 +80,17 @@ struct encode_options {
     uint32_t ring_slots;
     int32_t bitrate;
     unsigned long max_frames;
+
+    /*
+     * Overlay options. osd is off by default: the overlay costs a frame copy per
+     * frame, and the default pipeline is the one that has been soaked for eight
+     * hours and should stay byte for byte what it was.
+     */
+    int osd;
+    const char *osd_source;
+    const char *osd_mode;
+    float osd_amplitude_deg;
+    uint32_t osd_period_samples;
 };
 
 static void print_usage(const char *program)
@@ -75,6 +112,14 @@ static void print_usage(const char *program)
             "      --warmup N        discard initial frames (default: %u)\n"
             "      --threads         capture on its own thread via a frame ring\n"
             "      --ring-slots N    frame ring depth when --threads (default: %u)\n"
+            "      --osd             burn the sensor overlay into the video\n"
+            "      --osd-source SRC  sensor source for the overlay: mock\n"
+            "                        (default: %s). Only mock exists so far; the\n"
+            "                        MPU6050 source lands next.\n"
+            "      --osd-mode M      mock waveform: level, wave or ramp\n"
+            "                        (default: %s)\n"
+            "      --osd-amplitude D wave amplitude in degrees (default: %u)\n"
+            "      --osd-period N    wave period in samples (default: %u)\n"
             "  -q, --quiet           suppress the per frame encoder trace\n"
             "  -h, --help            show this help\n",
             program,
@@ -87,7 +132,11 @@ static void print_usage(const char *program)
             ENC_DEFAULT_BITRATE,
             ENC_DEFAULT_GOP,
             ENC_DEFAULT_WARMUP,
-            (unsigned)ENC_DEFAULT_RING_SLOTS);
+            (unsigned)ENC_DEFAULT_RING_SLOTS,
+            ENC_OSD_DEFAULT_SOURCE,
+            ENC_OSD_DEFAULT_MODE,
+            ENC_OSD_DEFAULT_AMPLITUDE,
+            ENC_OSD_DEFAULT_PERIOD);
 }
 
 static int parse_u32(const char *text, uint32_t *value)
@@ -395,6 +444,19 @@ int main(int argc, char **argv)
     uint32_t actual_width;
     uint32_t actual_height;
 
+    /*
+     * Overlay state, all owned here. `telemetry` is handed to the annotator on
+     * success and set to NULL so cleanup does not release it twice; the mock
+     * sensor is held separately because the feed borrows it rather than owning
+     * it.
+     */
+    struct mock_sensor_config osd_config;
+    struct mock_sensor *osd_sensor = NULL;
+    struct sensor_source osd_source;
+    struct osd_feed *feed = NULL;
+    struct osd_telemetry *telemetry = NULL;
+    struct osd_annotate *annotator = NULL;
+
     memset(&options, 0, sizeof(options));
     options.device = ENC_DEFAULT_DEVICE;
     options.output = "live.h264";
@@ -409,6 +471,11 @@ int main(int argc, char **argv)
     options.ring_slots = ENC_DEFAULT_RING_SLOTS;
     options.bitrate = ENC_DEFAULT_BITRATE;
     options.max_frames = 0U;
+    options.osd = 0;
+    options.osd_source = ENC_OSD_DEFAULT_SOURCE;
+    options.osd_mode = ENC_OSD_DEFAULT_MODE;
+    options.osd_amplitude_deg = (float)ENC_OSD_DEFAULT_AMPLITUDE;
+    options.osd_period_samples = ENC_OSD_DEFAULT_PERIOD;
 
     for (;;) {
         int option;
@@ -427,6 +494,11 @@ int main(int argc, char **argv)
             {"rtsp-port", required_argument, NULL, 1002},
             {"ring-slots", required_argument, NULL, 1003},
             {"threads", no_argument, NULL, 1004},
+            {"osd", no_argument, NULL, 1005},
+            {"osd-source", required_argument, NULL, 1006},
+            {"osd-mode", required_argument, NULL, 1007},
+            {"osd-amplitude", required_argument, NULL, 1008},
+            {"osd-period", required_argument, NULL, 1009},
             {"quiet", no_argument, NULL, 'q'},
             {"help", no_argument, NULL, 'h'},
             {NULL, 0, NULL, 0},
@@ -526,6 +598,57 @@ int main(int argc, char **argv)
             break;
         case 1004:
             options.threads = 1;
+            break;
+        case 1005:
+            options.osd = 1;
+            break;
+        case 1006:
+            /*
+             * Only the mock exists so far. The check is here rather than left to
+             * fail later so that a typo in a startup script reports itself at
+             * parse time, when the message can still name the flag, instead of
+             * surfacing as an overlay that quietly shows nothing.
+             */
+            if (strcmp(optarg, "mock") != 0) {
+                fprintf(stderr,
+                        "Invalid OSD source: %s (only 'mock' exists so far)\n",
+                        optarg);
+                return EXIT_FAILURE;
+            }
+            options.osd_source = optarg;
+            break;
+        case 1007:
+            if (strcmp(optarg, "level") != 0 && strcmp(optarg, "wave") != 0 &&
+                strcmp(optarg, "ramp") != 0) {
+                fprintf(stderr,
+                        "Invalid OSD mode: %s (use level, wave or ramp)\n",
+                        optarg);
+                return EXIT_FAILURE;
+            }
+            options.osd_mode = optarg;
+            break;
+        case 1008: {
+            char *end = NULL;
+            float value;
+
+            errno = 0;
+            value = strtof(optarg, &end);
+            if (errno != 0 || end == optarg || *end != '\0' || value < 0.0f ||
+                value > 90.0f) {
+                fprintf(stderr,
+                        "Invalid OSD amplitude: %s (0 to 90 degrees)\n", optarg);
+                return EXIT_FAILURE;
+            }
+            options.osd_amplitude_deg = value;
+            break;
+        }
+        case 1009:
+            if (parse_u32(optarg, &options.osd_period_samples) == -1 ||
+                options.osd_period_samples < 4U) {
+                fprintf(stderr, "Invalid OSD period: %s (at least 4 samples)\n",
+                        optarg);
+                return EXIT_FAILURE;
+            }
             break;
         case 'h':
             print_usage(argv[0]);
@@ -674,6 +797,83 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    /*
+     * Overlay setup, after the geometry is settled because the annotator's
+     * scratch buffer is sized from it. Everything here is optional: with no
+     * --osd the annotator is never opened and osd_annotate_apply is not called
+     * at all, so the default pipeline keeps its existing code path byte for
+     * byte.
+     */
+    if (options.osd) {
+        struct osd_telemetry_config telemetry_config;
+        struct osd_annotate_config annotate_config;
+
+        memset(&osd_config, 0, sizeof(osd_config));
+        osd_config.mode = MOCK_SENSOR_WAVE;
+        if (strcmp(options.osd_mode, "level") == 0) {
+            osd_config.mode = MOCK_SENSOR_LEVEL;
+        } else if (strcmp(options.osd_mode, "ramp") == 0) {
+            osd_config.mode = MOCK_SENSOR_RAMP;
+        }
+        osd_config.amplitude_deg = options.osd_amplitude_deg;
+        osd_config.period_samples = options.osd_period_samples;
+
+        if (mock_sensor_open(&osd_config, &osd_sensor) == -1) {
+            fprintf(stderr, "Failed to open the mock sensor\n");
+            goto cleanup;
+        }
+        osd_source = mock_sensor_source(osd_sensor);
+
+        if (osd_feed_open(NULL, &osd_source, &feed) == -1) {
+            fprintf(stderr, "Failed to open the OSD feed\n");
+            goto cleanup;
+        }
+
+        memset(&telemetry_config, 0, sizeof(telemetry_config));
+        telemetry_config.panel = true;
+        /*
+         * Knockout, so the letters are cut out of a light panel. Over live
+         * video this is the readable choice regardless of what the camera is
+         * pointed at; plain light text would vanish against a bright scene.
+         */
+        telemetry_config.knockout = true;
+        telemetry_config.panel_padding = ENC_OSD_PADDING;
+        telemetry_config.origin_x = ENC_OSD_ORIGIN_X;
+        telemetry_config.origin_y = ENC_OSD_ORIGIN_Y;
+
+        if (osd_telemetry_open(&telemetry_config, &telemetry) == -1) {
+            fprintf(stderr, "Failed to open the OSD overlay\n");
+            goto cleanup;
+        }
+
+        memset(&annotate_config, 0, sizeof(annotate_config));
+        annotate_config.width = actual_width;
+        annotate_config.height = actual_height;
+
+        if (osd_annotate_open(&annotate_config, telemetry, &annotator) == -1) {
+            /*
+             * The annotator owns the telemetry from here on its success path; on
+             * failure it did not take it, so it is cleared to avoid a double
+             * free at cleanup.
+             */
+            fprintf(stderr, "Failed to open the frame annotator\n");
+            osd_telemetry_destroy(telemetry);
+            telemetry = NULL;
+            goto cleanup;
+        }
+
+        /*
+         * Handed over: the annotator destroys it. Clearing the local copy is
+         * what keeps cleanup from freeing it a second time.
+         */
+        telemetry = NULL;
+
+        fprintf(stderr, "OSD: on, source=%s mode=%s, %ux%u at (%u,%u)\n",
+                options.osd_source, options.osd_mode, actual_width,
+                actual_height, (unsigned)ENC_OSD_ORIGIN_X,
+                (unsigned)ENC_OSD_ORIGIN_Y);
+    }
+
     memset(&encoder_config, 0, sizeof(encoder_config));
     encoder_config.width = actual_width;
     encoder_config.height = actual_height;
@@ -807,6 +1007,7 @@ int main(int argc, char **argv)
         {
             struct frame_ring *ring = capture_thread_ring(capture);
             const struct frame_ring_slot *slot = NULL;
+            const uint8_t *encode_source = NULL;
 
             while (!g_stop &&
                    (options.max_frames == 0U || encoded < options.max_frames)) {
@@ -828,8 +1029,33 @@ int main(int argc, char **argv)
                 }
                 last_timestamp = slot->pts_us * 1000ULL;
 
+                /*
+                 * Annotate before encoding, and encode the annotated frame.
+                 *
+                 * slot->data is a read-only borrow from the ring, and the
+                 * annotator honours that by compositing into its own copy - so
+                 * no `const` is cast away and the ring's guarantee that a
+                 * borrowed frame is stable still holds. With no --osd the
+                 * annotator is NULL, this returns slot->data unchanged, and the
+                 * cost is one pointer test.
+                 *
+                 * The feed is advanced here rather than on the capture thread
+                 * because the counters it reports (frame count, frame
+                 * timestamp) are this loop's, and because the sensor read must
+                 * not be on the path that has to keep up with the camera.
+                 */
+                if (annotator != NULL) {
+                    struct osd_telemetry_input *osd_input = osd_feed_next(
+                        feed, encode_monotonic_ns() / 1000ULL, slot->pts_us,
+                        (uint64_t)encoded);
+                    encode_source = osd_annotate_apply(annotator, slot->data,
+                                                       osd_input);
+                } else {
+                    encode_source = slot->data;
+                }
+
                 if (mpp_encoder_encode_nv12(encoder,
-                                            slot->data,
+                                            encode_source,
                                             slot->length,
                                             last_timestamp,
                                             sink) == -1) {
@@ -941,12 +1167,32 @@ int main(int argc, char **argv)
             }
             last_timestamp = timestamp;
 
-            if (mpp_encoder_encode_nv12(encoder,
-                                        tight_nv12,
-                                        tight_size,
-                                        timestamp,
-                                        sink) == -1) {
-                goto cleanup;
+            /*
+             * Same annotate-then-encode as the threaded path. Here the source
+             * buffer is this loop's own tight_nv12 rather than a ring borrow, so
+             * the copy is not protecting a contract - but going through the same
+             * call keeps the two paths from diverging, and the run-time cost is
+             * one extra memcpy that this path can afford, because if it could
+             * not there would be a frame ring in front of it.
+             */
+            {
+                const uint8_t *encode_source = tight_nv12;
+
+                if (annotator != NULL) {
+                    struct osd_telemetry_input *osd_input = osd_feed_next(
+                        feed, timestamp / 1000ULL, timestamp / 1000ULL,
+                        (uint64_t)encoded);
+                    encode_source =
+                        osd_annotate_apply(annotator, tight_nv12, osd_input);
+                }
+
+                if (mpp_encoder_encode_nv12(encoder,
+                                            encode_source,
+                                            tight_size,
+                                            timestamp,
+                                            sink) == -1) {
+                    goto cleanup;
+                }
             }
 
             encoded++;
@@ -971,6 +1217,54 @@ int main(int argc, char **argv)
     exit_code = EXIT_SUCCESS;
 
 cleanup:
+    /*
+     * Overlay teardown first, before the encoder closes: the statistics are
+     * worth printing even on the failure paths, and they are the only way to
+     * tell "the overlay was never drawn" from "the overlay was drawn but the
+     * frame was refused" after a run that did not work.
+     *
+     * The order between these three matters. The annotator owns the telemetry,
+     * so it goes first; the feed borrows the source, so the source outlives it.
+     */
+    if (annotator != NULL) {
+        struct osd_annotate_stats stats;
+
+        osd_annotate_stats(annotator, &stats);
+        fprintf(stderr,
+                "OSD annotated=%lu passed_through=%lu composite_refused=%lu\n",
+                stats.annotated, stats.passed_through,
+                stats.composite_refused);
+        osd_annotate_destroy(annotator);
+        annotator = NULL;
+    }
+
+    if (feed != NULL) {
+        struct osd_feed_stats stats;
+
+        osd_feed_stats(feed, &stats);
+        fprintf(stderr,
+                "OSD sensor polls=%lu samples=%lu no_sample=%lu errors=%lu\n",
+                stats.sensor_polls, stats.samples, stats.no_sample,
+                stats.sensor_errors);
+        osd_feed_destroy(feed);
+        feed = NULL;
+    }
+
+    /*
+     * Only reachable if the annotator was never opened OR its open failed after
+     * the telemetry succeeded - the success path sets this to NULL because the
+     * annotator took ownership and will have freed it above.
+     */
+    if (telemetry != NULL) {
+        osd_telemetry_destroy(telemetry);
+        telemetry = NULL;
+    }
+
+    if (osd_sensor != NULL) {
+        mock_close(osd_sensor);
+        osd_sensor = NULL;
+    }
+
     if (streaming) {
         buf_type = capture_buf_type(selected_kind);
         xioctl(fd, VIDIOC_STREAMOFF, &buf_type);

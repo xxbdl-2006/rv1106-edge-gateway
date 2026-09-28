@@ -35,6 +35,18 @@ MEDIA_SRC := src/mpp_encoder.c src/sink_file.c src/sink_queue.c \
 	src/rtp_h264.c src/rtsp_proto.c src/rtsp_server.c \
 	src/frame_ring.c src/capture_thread.c
 
+# The OSD stack, linked into the board program now that the overlay can be
+# enabled with --osd. src/mock_sensor.c and src/sensor_attitude.c come along
+# because the mock source produces raw vectors and the attitude layer turns them
+# into the angles the overlay displays. None of these touch the SDK.
+#
+# They are host safe by construction - no sockets, no ioctl, no Linux headers -
+# which is what lets the same files be linked into the test targets above and
+# give identical output on both sides.
+OSD_SRC := src/osd_font.c src/osd_format.c src/osd_overlay.c \
+	src/osd_telemetry.c src/osd_feed.c src/osd_annotate.c \
+	src/mock_sensor.c src/sensor_attitude.c
+
 # Sensor sources are deliberately NOT part of MEDIA_SRC: nothing in the video
 # pipeline references them yet, so adding them here would only enlarge the
 # board binary without changing behaviour.
@@ -45,7 +57,7 @@ MEDIA_SRC := src/mpp_encoder.c src/sink_file.c src/sink_queue.c \
 # elsewhere, which is what lets the test targets list them unconditionally.
 SENSOR_SRC := src/mpu6050.c src/mpu6050_i2c.c src/i2c_bitbang.c src/gpio_sysfs.c
 
-.PHONY: all clean test host-syntax mpu6050-probe
+.PHONY: all clean test host-syntax mpu6050-probe host-syntax-can-fail
 all: v4l2_capture v4l2_mpp_encode
 
 v4l2_capture: src/v4l2_capture.c src/capture_signal.h
@@ -56,10 +68,11 @@ v4l2_mpp_encode: src/v4l2_mpp_encode.c src/mpp_encoder.c src/mpp_encoder.h src/v
 	src/sink_file.h src/sink_file.c src/sink_queue.h src/sink_queue.c \
 	src/h264_util.h src/h264_util.c \
 	src/frame_ring.h src/frame_ring.c src/capture_thread.h src/capture_thread.c \
+	src/osd_annotate.h src/osd_feed.h \
 	src/capture_signal.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Wno-unused-function -Wno-pedantic \
 		$(MPP_CPPFLAGS) $(ROCKIT_CPPFLAGS) $(LDFLAGS) \
-		-o $@ src/v4l2_mpp_encode.c $(MEDIA_SRC) \
+		-o $@ src/v4l2_mpp_encode.c $(MEDIA_SRC) $(OSD_SRC) \
 		$(MPP_LDFLAGS) $(ROCKIT_LDFLAGS) $(ROCKIT_LDLIBS)
 
 TEST_CFLAGS := -O1 -g -Wall -Wextra -Wpedantic -std=gnu11 -Isrc \
@@ -127,8 +140,22 @@ test-osd: tests/test_osd.c src/osd_font.c src/osd_font.h src/osd_overlay.c \
 		src/osd_font.c src/osd_overlay.c src/osd_format.c \
 		src/osd_telemetry.c
 
+# The two files that sit between the sensor and the encoder: the feed that keeps
+# the telemetry input current, and the annotator that composites the overlay
+# into a private copy of the frame. Neither touches V4L2 or the SDK, so the
+# assertion that matters most - that the overlay is really present in the bytes
+# the encoder will see - is checkable here rather than by eye on a monitor.
+test-osd-pipeline: tests/test_osd_pipeline.c src/osd_feed.c src/osd_feed.h \
+	src/osd_annotate.c src/osd_annotate.h src/sensor_source.h \
+	src/osd_telemetry.c src/osd_telemetry.h src/osd_overlay.c src/osd_overlay.h \
+	src/osd_font.c src/osd_font.h src/osd_format.c src/osd_format.h
+	$(HOSTCC) $(TEST_CFLAGS) -o $@ tests/test_osd_pipeline.c \
+		src/osd_feed.c src/osd_annotate.c src/osd_telemetry.c \
+		src/osd_overlay.c src/osd_font.c src/osd_format.c
+
 test: test-packet-queue test-rtp-rtsp test-frame-ring test-capture-thread \
-	test-mpu6050 test-i2c-bitbang test-sensor test-osd board-flags
+	test-mpu6050 test-i2c-bitbang test-sensor test-osd test-osd-pipeline \
+	board-flags host-syntax-can-fail
 	./test-packet-queue
 	./test-rtp-rtsp
 	./test-frame-ring
@@ -137,6 +164,7 @@ test: test-packet-queue test-rtp-rtsp test-frame-ring test-capture-thread \
 	./test-i2c-bitbang
 	./test-sensor
 	./test-osd
+	./test-osd-pipeline
 
 # Includes every target that compiles a file from tools/, which is where the
 # "living in another directory" problem comes from. Files under src/ resolve
@@ -149,15 +177,21 @@ mpu6050-probe: tools/mpu6050-probe.c $(SENSOR_SRC) src/mpu6050.h
 		tools/mpu6050-probe.c $(SENSOR_SRC) $(LDLIBS)
 
 # src/rtsp_server.c is the only file that needs POSIX sockets, which MinGW does
-# not provide. src/v4l2_mpp_encode.c cannot be checked here at all because it
-# pulls in linux/videodev2.h through v4l2_capture.c. On Windows these targets
-# still catch syntax errors, typos and new warnings through tests/host-stubs.
-# On Linux they are unnecessary but harmless.
+# not provide. On Windows these targets still catch syntax errors, typos and new
+# warnings through tests/host-stubs. On Linux they are unnecessary but harmless.
 #
 # The last two define __linux__ so the Linux-only halves are compiled too,
 # against the stubs in tests/host-stubs/linux. That is how src/mpu6050_i2c.c
 # gets checked without a board; it already paid for itself by catching an
 # EREMOTEIO that uclibc does not always export.
+#
+# src/v4l2_mpp_encode.c is checked here too, with __linux__ and the same stub
+# tree. It pulls in linux/videodev2.h through v4l2_capture.c, which MinGW has no
+# copy of, so tests/host-stubs/linux/videodev2.h supplies the declarations that
+# file names. This matters more than it looks: the encoder is where nearly all
+# integration lands (sinks, RTSP, the OSD feed), and before this target existed
+# every edit to it went unparsed on the host. See the stub's header comment for
+# what it deliberately does not model.
 host-syntax: src/rtsp_server.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs \
 		-include extra.h src/rtsp_server.c
@@ -172,12 +206,16 @@ host-syntax: src/rtsp_server.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/osd_overlay.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/osd_format.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/osd_telemetry.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/osd_feed.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/osd_annotate.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
 		src/mpu6050_i2c.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
 		src/gpio_sysfs.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
 		tools/mpu6050-probe.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
+		-include extra.h src/v4l2_mpp_encode.c
 
 # Check the sensor sources the way the BOARD build compiles them, rather than
 # with the test flags.
@@ -199,12 +237,14 @@ host-syntax: src/rtsp_server.c
 # variable makes this target fail with the same fatal error the board hit,
 # which is the whole point.
 #
+# board-flags differs from host-syntax in the *flags*, not the files: it uses
+# CPPFLAGS and CFLAGS so a mismatch between what we check and what the board
+# compiles shows up here. The video targets are now included for the same
+# reason, checked the way the board would.
+#
 # No claim is made about catching -O2-only warnings. CFLAGS is used as-is for
 # consistency, but -fsyntax-only does not run the optimisation passes that
 # would produce them, so this target does not check for them.
-#
-# The video targets still cannot be checked on this side: they pull
-# linux/videodev2.h and SDK headers that MinGW does not have.
 .PHONY: board-flags
 board-flags:
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(TOOLS_CPPFLAGS) $(CFLAGS) \
@@ -222,8 +262,45 @@ board-flags:
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/osd_overlay.c
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/osd_format.c
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/osd_telemetry.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/osd_feed.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/osd_annotate.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) \
+		-Itests/host-stubs -D__linux__ -include extra.h \
+		-D__USE_MINGW_ANSI_STDIO=1 src/v4l2_mpp_encode.c
+
+# Proof that the two targets above are actually checking something.
+#
+# tests/host-stubs/linux/videodev2.h is a stub we wrote; a stub that is too
+# permissive, or that silently fails to be found, would let the encoder pass
+# while being full of errors -- and the check would look fine. A green check
+# that cannot go red is worse than no check, because it is trusted.
+#
+# So: take a copy of the encoder, break it in a way that is a real class of
+# mistake (a misspelled struct member, exactly what the pre-stub workflow kept
+# shipping), and assert the compiler rejects it. If this target ever fails, the
+# stub has drifted away from the source and the other two targets are lying.
+#
+# The copy lives in the build tree, not /tmp, so this works the same on Windows
+# and Linux. It is deleted on success and left behind on failure for inspection.
+.PHONY: host-syntax-can-fail
+host-syntax-can-fail:
+	cp src/v4l2_mpp_encode.c v4l2_mpp_encode.mutant.c
+	sed -i.bak 's/osd_annotate_apply(annotator, slot->data,/osd_annotate_apply(annotator, slot->datum,/' \
+		v4l2_mpp_encode.mutant.c
+	rm -f v4l2_mpp_encode.mutant.c.bak
+	@if $(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs \
+		-D__linux__ -include extra.h v4l2_mpp_encode.mutant.c >/dev/null 2>&1; then \
+		echo "host-syntax-can-fail: FAIL (the stub accepted a broken encoder)"; \
+		echo "  the mutant was left at v4l2_mpp_encode.mutant.c"; \
+		rm -f v4l2_mpp_encode.mutant.c; \
+		exit 1; \
+	else \
+		echo "host-syntax-can-fail: PASS (the stub rejected a misspelled member)"; \
+		rm -f v4l2_mpp_encode.mutant.c; \
+	fi
 
 clean:
 	rm -f v4l2_capture v4l2_mpp_encode mpu6050-probe test-packet-queue \
 		test-rtp-rtsp test-frame-ring test-capture-thread test-mpu6050 \
-		test-i2c-bitbang test-sensor test-osd
+		test-i2c-bitbang test-sensor test-osd test-osd-pipeline \
+		v4l2_mpp_encode.mutant.c v4l2_mpp_encode.mutant.c.bak
