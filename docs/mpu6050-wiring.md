@@ -129,7 +129,97 @@ pin 71 (gpio2-7): (MUX UNCLAIMED) (GPIO UNCLAIMED)
 
 ---
 
-## 3. 需要改设备树把 i2c3 打开
+## 2.5 ✅ 实测结果：接线正确，传感器已经活了（2026-09-21）
+
+接好线后的实测（**用第 4 节的 bit-bang 工具，没改一行设备树**）：
+
+```
+$ adb shell "python3 /userdata/i2c-bitbang.py scan"
+scanning 0x03..0x77 (SCL=gpio70 SDA=gpio71 delay=25us)
+  found 0x68
+done, 1 device(s) found
+```
+
+**总线扫描到 `0x68`** —— AD0 接 GND 的默认地址，接线、供电、上拉全部正确。
+
+```
+$ adb shell "python3 /userdata/i2c-bitbang.py id 0x68"
+[1] WHO_AM_I (0x75) = 0x70
+[2] PWR_MGMT_1=0x00 ACCEL_CFG=0x00 GYRO_CFG=0x00 (all should be 0x00)
+[3] sampling 5 frames (accel + temp + gyro) ...
+    #0  a=( -2648,   -72, 17144) g=(   552,  -594,  -259)  48.0 degC
+    #1  a=( -2632,   -52, 17224) g=(   567,  -641,  -259)  48.0 degC
+    #2  a=( -2624,  -148, 17136) g=(   558,  -619,  -239)  48.0 degC
+[4] verdict: |az|=1.054 g  -> healthy, still sensor
+```
+
+### ⚠️ 重要发现：`WHO_AM_I = 0x70`，模块上不是原厂 MPU6050
+
+期望 `0x68`，实测 `0x70`。这**不是接线问题**，是芯片型号问题。
+
+`0x70` 是 **MPU6500** 的 ID。GY-521 模块换料很常见。
+
+**决定性证据** —— 我还做了寄存器回环与掩码测试：
+
+| 测试 | 真 MPU6050 应该 | 实测 | 说明 |
+|---|---|---|---|
+| `SMPLRT_DIV(0x19)` 写 `0xAB` 读回 | `AB` | **`AB`** | ✅ 真实可读写寄存器 |
+| `SMPLRT_DIV(0x19)` 写 `0x5A` 读回 | `5A` | **`5A`** | ✅ 不是影子/缓存 |
+| `CONFIG(0x1A)` 写 `0xFF` 读回 | 只保留低 3 位 = `07` | **`FF`** | ⚠️ **8 位全可写，位掩码不同** |
+| `0x00-0x0F` 反复读 | 大部分 0 | 恒定 `CF D3 DF E1 94 19 FA E3 EB 00 07 F8 00 60 60 89` | ⚠️ 出厂自检/偏移值，非随机 |
+
+**对项目的影响：零。**
+
+| 项目 | MPU6050 | MPU6500 | 本模块 |
+|---|---|---|---|
+| 加速度输出 | `0x3B` | `0x3B` | ✅ 一致 |
+| 温度输出 | `0x41` | `0x41` | ✅ 一致 |
+| 陀螺仪输出 | `0x43` | `0x43` | ✅ 一致 |
+| 数据格式 | 16 位补码 | 16 位补码 | ✅ 一致 |
+| ±2g 灵敏度 | 16384 LSB/g | 16384 LSB/g | ✅ 一致 |
+| ±250dps 灵敏度 | 131 LSB/dps | 131 LSB/dps | ✅ 一致 |
+| 温度公式 | `raw/340 + 36.53` | 同 | ✅ 一致 |
+
+**两条编码规则（务必遵守）**：
+
+1. ❌ **不要**用 `if (who == 0x68)` 做存在性/型号判断。改成接受
+   `{0x68, 0x70, 0x71, 0x72, 0x73, 0x98}` 这一族。
+2. ❌ **不要**依赖 `CONFIG(0x1A)` 的位掩码行为（`0xFF` 会原样存回来）。
+
+### 静止偏差校准常数（实测采集，100 样本）
+
+```
+accel mean (LSB): -2639.36     -67.48   17194.92
+gyro  mean (LSB):   552.52    -611.66    -240.35
+temp  mean      :  3882.30  -> 47.95 degC
+accel |mean|    : 1.0618 g
+```
+
+生成可直接粘贴的常数：
+
+```c
+#define IMU_ACCEL_BIAS_X   (-2639f)
+#define IMU_ACCEL_BIAS_Y   (-67f)
+#define IMU_ACCEL_BIAS_Z   (811f)      /* 17195 - 16384 */
+#define IMU_GYRO_BIAS_X    (553f)
+#define IMU_GYRO_BIAS_Y    (-612f)
+#define IMU_GYRO_BIAS_Z    (-240f)
+#define IMU_ACCEL_LSB_PER_G   16384.0f
+#define IMU_GYRO_LSB_PER_DPS  131.0f
+#define IMU_TEMP_LSB_PER_DEG  340.0f
+#define IMU_TEMP_OFFSET_C     36.53f
+```
+
+> **关于 `|mean| = 1.0618 g`**：这**不是**传感器误差，是**模块物理倾斜**了约 9.3°。
+> `asin(2639/16384) = 9.3°`（X 轴）、`asin(67/16384) = 0.24°`（Y 轴）。
+> MPU6050 模块插在垂直排针上必然带点角度。**注意 `IMU_ACCEL_BIAS_Z = 811`
+> 里已经隐含了这个倾斜**（把 X/Y 的偏置当成"零偏"处理了）——
+> 严谨做法是**先摆平再采集**，或改用姿态算法时**不做 Z 轴归零**。
+> 当前常数适用于"模块保持这个安装角度"的场景。
+
+---
+
+## 3. i2c3 是 disabled，但**不需要**打开它（见第 4 节）
 
 本固件实测只有 i2c4 是 `okay`：
 
@@ -144,122 +234,127 @@ i2c@ff470000 status=okay      <- 这个就是 i2c4
 
 （`ff470000` = i2c4，由 pinmux 输出的 `ff470000.i2c function i2c4` 反证。）
 
-所以要把 i2c3 打开，需要在板级 dts（`<SDK>/sysdrv/source/kernel/arch/arm/boot/dts/rv1106g-luckfox-pico-pro-max.dts`）
-里：
+**如果将来要真正启用 i2c3**，改法如下（板级 dts：
+`<SDK>/sysdrv/source/kernel/arch/arm/boot/dts/rv1106g-luckfox-pico-pro-max.dts`）：
 
 ```dts
-&pinctrl {
-    i2c3 {
-        i2c3m0_xfer: i2c3m0-xfer {
-            rockchip,pins =
-                <2 RK_PA6 3 &pcfg_pull_none_smt>,   /* SCL: GPIO2_A6 */
-                <2 RK_PA7 3 &pcfg_pull_none_smt>;   /* SDA: GPIO2_A7 */
-        };
-    };
-};
-
 &i2c3 {
     status = "okay";
     pinctrl-names = "default";
-    pinctrl-0 = <&i2c3m0_xfer>;
-    clock-frequency = <100000>;    /* 400k 也行，首次调试建议 100k */
-};
-```
-
-⚠️ **改设备树必须重编内核 + 重刷固件**，会打断正在跑的测试。
-
----
-
-## 4. 不重刷固件的替代路线：用 i2c4m0 临时验证
-
-如果**只调 MPU6050、暂时不管摄像头**，可以切 `i2c4` 到 m0，这样引脚就是排针的
-**pin 34 (SDA) / pin 32 (SCL)**（注意：这两个脚在官方图里**没有** I2C 标注，
-是 i2c4m0 的复用出口，需要改 dts 才会变成 I2C 功能）：
-
-```dts
-&i2c4 {
-    status = "okay";
-    pinctrl-names = "default";
-    pinctrl-0 = <&i2c4m0_xfer>;    /* 原来是 &i2c4m2_xfer */
+    pinctrl-0 = <&i2c3m0_xfer>;   /* 固件里已经定义好了，直接引用 */
     clock-frequency = <100000>;
 };
 ```
 
-**注意**：这与摄像头**互斥** —— 切过去摄像头就没 I2C 了。
+> **好消息**：本固件（`uboot-09/13/2026`）的 `pinctrl-0` **已经指向 `i2c3m0-xfer`**
+> （实测 `i2c@ff460000/pinctrl-0 = 0x2f, 0x30`，其中 `0x30` 的 phandle 解析出来
+> 就是 `pinctrl/i2c3/i2c3m0-xfer`，pins = `bank2 pin6 mux5` + `bank2 pin7 mux5` = GPIO2_A6/A7）。
+> **所以只需要翻一个 `status`，pinctrl 一行都不用改。**
 
-**决策建议**：
+⚠️ 但改设备树要**重编内核 + 重刷固件**，会打断正在跑的测试。
+**除非要上线，否则不要走这条路** —— 第 4 节的 bit-bang 方案不用改任何东西。
 
-| 场景 | 方案 | 是否重刷 |
+---
+
+## 3.5 ❌ 运行时 device-tree overlay 在这块板子上是坏的（已实测证伪）
+
+理论上最优雅的方案是运行时打 overlay 翻 `status`，不动 flash。
+**实测证明这条路在这块板子上走不通。** 证据链：
+
+**（1）内核配置是开的，configfs 也挂了**
+
+```
+CONFIG_OF_OVERLAY=y
+none on /sys/kernel/config type configfs (rw,relatime)
+```
+
+**（2）overlay 目录可以建、dtbo 确实写进去了**
+
+```
+$ mkdir /sys/kernel/config/device-tree/overlays/i2c3
+$ cat i2c3-enable.dtbo > .../i2c3/dtbo
+$ wc -c < .../i2c3/dtbo
+223                      <- 与源文件字节数一致，数据没丢
+```
+
+**（3）但它完全不生效 —— 决定性对照实验**
+
+| 写入内容 | 正常内核应该 | 这块板子实际 |
 |---|---|---|
-| 摄像头和 MPU6050 都要用 | 启用 **i2c3**（排针 pin 14/24） | 需重刷 |
-| 只调 MPU6050，摄像头暂时不用 | i2c4 切 m0（排针 pin 34/32） | 需重刷 |
-| 先验证软件逻辑，不动硬件 | 见第 5 节，先跑 `mpu6050-probe` 看"总线上什么都没有" | 不需要 |
+| 合法 dtbo（223B）      | `status=applied`，dmesg 有 fragment 日志 | `rc=0`，dmesg **空白** |
+| **`GARBAGE` 字符串**   | **返回 `-EINVAL`** | **`rc=0` 成功** ← 致命 |
+
+```
+$ echo GARBAGE > /sys/kernel/config/device-tree/overlays/badtest/dtbo
+rc=0
+$ cat /sys/kernel/config/device-tree/overlays/badtest/status
+0
+```
+
+**写入非法数据也"成功"** ⇒ 这个 configfs 的 `dtbo` 属性是**哑写入路径**：
+数据被存下来了，但内核**根本没走 overlay 解析与 notifier 流程**。
+
+补充证据：`status` 属性的内容是**纯数字 `0`**，而正常内核会返回
+`unapplied` / `applied` 之类的文本状态。dmesg 里 `grep -iE 'overlay|of_ov|fragment'`
+**一条都没有**。
+
+**结论**：`/dev/i2c-3` 永远不会通过 overlay 出现。别再在这条路上花时间。
 
 ---
 
-## 5. 先验证软件，再动硬件
+## 4. ✅ 真正可用的方案：GPIO 位翻转（bit-bang）I2C
 
-即使一根线没接，程序也应该**干净地报告"总线上什么都没有"**，而不是崩溃或挂死。
-这是可以先做的事（**现在就能做，不用重刷**）：
+### 为什么可行
+
+i2c3 既然是 `disabled`，它的 pinctrl 就没被 claim，pin 70/71 是**干净的普通 GPIO**：
+
+```
+$ cat /sys/kernel/debug/pinctrl/*/pinmux-pins | grep -E 'pin (70|71) '
+pin 70 (gpio2-6): (MUX UNCLAIMED) (GPIO UNCLAIMED)
+pin 71 (gpio2-7): (MUX UNCLAIMED) (GPIO UNCLAIMED)
+```
+
+（顺带：整个 GPIO2 bank 32 个脚**全部 UNCLAIMED**，非常自由。）
+
+`gpio70` = SCL = 排针 **pin 24**，`gpio71` = SDA = 排针 **pin 14**。
+用 `/sys/class/gpio/gpioNN/{direction,value}` 位翻转，**纯用户态**就能模拟 I2C 主机。
+
+| 优点 | 说明 |
+|---|---|
+| 零设备树改动 | 不动 flash、不重刷 |
+| 零内核改动 | 不需要交叉编译 |
+| 零重启 | **完全不打断网关推流** |
+| 可完全回滚 | 进程退出即结束，引脚回输入 |
+
+### 代价：时钟慢
+
+sysfs GPIO 单次读写约 10~50μs，做不到标准 100kHz。
+**但 I2C 从机对时钟频率没有下限** —— MPU6050 在约 20kHz 下工作完全正常。
+实测读 14 字节（一次完整六轴突发）耗时约十几毫秒，对 100Hz 的姿态采样**绰绰有余**。
+
+### 工具
+
+`tools/i2c-bitbang.py`（约 18KB，纯标准库，板端 python3 3.11.6 直接跑）：
 
 ```bash
-# 交叉编译探测工具
-cd /mnt/hgfs/luckfox_share/rv1103
-make mpu6050-probe CROSS_COMPILE=arm-rockchip830-linux-uclibcgnueabihf-
+adb push tools/i2c-bitbang.py /userdata/
 
-# 推到板子
-adb push mpu6050-probe /userdata/
-
-# 扫描 —— 没接东西时会报 "nothing on the bus"
-adb shell "/userdata/mpu6050-probe --bus 4"
+adb shell "python3 /userdata/i2c-bitbang.py scan"            # 扫描总线
+adb shell "python3 /userdata/i2c-bitbang.py id 0x68"        # 身份 + 唤醒 + 读六轴
+adb shell "python3 /userdata/i2c-bitbang.py calib 0x68 100" # 静止偏差 -> 校准常数
+adb shell "python3 /userdata/i2c-bitbang.py read 0x68 0x75" # 读单寄存器
+adb shell "python3 /userdata/i2c-bitbang.py dump 0x68 0x00 0x50"
+adb shell "python3 /userdata/i2c-bitbang.py --delay 10 scan" # 调快半周期(us)
 ```
 
-预期输出（**未接线时**）：
+### 三个实现要点（踩过的坑）
 
-```
-bus: /dev/i2c-4 (fd 3)
-scanning bus for ACKs (0x08..0x77)...
-  0x30: present          <- 摄像头
-  0x31: present          <- 摄像头
-  ...（MPU6050 不会出现）
-```
-
-接好线后应该多出：
-
-```
-  0x68: present  <- MPU6050 with AD0 = low
-```
-
-**这个对比就是接线是否成功的最直接判据。** 看到 `0x68` 就说明线接对了、地址对了、供电对了。
-
----
-
-## 6. 接好线之后的验证步骤
-
-```bash
-# 1. 扫描确认 0x68 出现
-adb shell "/userdata/mpu6050-probe --bus 4"
-
-# 2. 读 WHO_AM_I + 打印实时数据（静止时应看到某个轴 ≈ ±1.000 g）
-adb shell "/userdata/mpu6050-probe --bus 4 --dump --count 20"
-```
-
-预期 `--dump` 输出：
-
-```
-WHO_AM_I = 0x68 (expect 0x68)
- #  accel[g]            gyro[dps]           temp[C]
- 0   +0.012  -0.003  +0.998    +0.15    -0.08    +0.05    36.51
- ...
-|a| = 1.000 g (expect ~1.000 when still)
-```
-
-**三个判据**：
-- `WHO_AM_I = 0x68` → 通信通了
-- 三轴合成 `|a| ≈ 1.000 g` → 量程/标定正确（地球重力）
-- `temp ≈ 36.5°C`（室温偏高一点是正常的，芯片自发热）→ 温度换算正确
-
-若 `|a|` 明显偏离 1.0（比如 8.0），说明量程配置错了 —— 但单测已经覆盖了这个换算，所以更可能是硬件问题。
+1. **开漏语义**：输出高 = `direction=in`（让外部上拉拉高），**不是**推高。
+   I2C 是多主总线，任何设备都只能拉低不能推高，否则会打架。
+2. **`sda_read()` 必须先切回 `in`** —— 若引脚还配成 `out`，读 `value` 读到的是
+   **输出锁存器**的值而不是**线上实际电平**，永远得到自己刚写的值。
+3. **每笔事务结束都要 `stop()` + 释放引脚**。异常路径若把 SCL 留在低电平，
+   从机会一直等下一个时钟，整条总线卡死。工具里有 `bus_recover()`（发 9 个 SCL + STOP）兜底。
 
 ---
 

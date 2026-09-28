@@ -1,0 +1,70 @@
+/*
+ * Runtime overlay that turns on the i2c3 controller so an MPU6050 (or any
+ * other i2c sensor) on header pin 24 (SCL, GPIO2_A6) and pin 14 (SDA,
+ * GPIO2_A7) becomes reachable as /dev/i2c-3.
+ *
+ * Why this exists: the shipped device tree has i2c0..i2c3 all set to
+ * "disabled" and only i2c4 "okay". The pins are already muxed correctly -
+ * i2c@ff460000's pinctrl-0 already points at i2c3m0-xfer (bank2 pin6/pin7,
+ * mux 5), which is exactly GPIO2_A6/A7 - so the only thing missing is the
+ * status flag. This overlay flips it without touching the flash.
+ *
+ * Build (on the board, where dtc lives):
+ *   dtc -@ -I dts -O dtb -o i2c3-enable.dtbo i2c3-enable.dts
+ *
+ * Apply (runtime, no reboot, no reflash):
+ *   mkdir /sys/kernel/config/device-tree/overlays/i2c3
+ *   cat i2c3-enable.dtbo > /sys/kernel/config/device-tree/overlays/i2c3/dtbo
+ *   ls /dev/i2c-3
+ *
+ * Remove (put it back the way it was):
+ *   rmdir /sys/kernel/config/device-tree/overlays/i2c3
+ *
+ * =====================================================================
+ *  STATUS 2026-09-21: THIS DOES NOT WORK ON THIS BOARD. KEPT FOR REFERENCE.
+ * =====================================================================
+ * It compiles fine (223 bytes, status=okay verified with fdtget) and the
+ * configfs write path accepts it, but the kernel never acts on it:
+ *
+ *   - writing the literal string "GARBAGE" as dtbo also returns rc=0,
+ *     where a working kernel returns -EINVAL. The write path is a no-op.
+ *   - /sys/kernel/config/device-tree/overlays/<name>/status reads back as
+ *     the bare number 0, not the usual "unapplied"/"applied" text.
+ *   - dmesg contains no of_overlay / fragment / resolve lines at all,
+ *     neither success nor failure.
+ *
+ * Net effect: /dev/i2c-3 never appears. CONFIG_OF_OVERLAY=y is set, so the
+ * problem is in the configfs overlay plumbing or a missing notifier, not a
+ * config option.
+ *
+ * WHAT TO USE INSTEAD: tools/i2c-bitbang.py. Since i2c3 is disabled its
+ * pinctrl is never claimed, so gpio70/gpio71 are plain unclaimed GPIO
+ * (verified: "pin 70 (gpio2-6): (MUX UNCLAIMED) (GPIO UNCLAIMED)") and can
+ * be bit-banged from userspace. No device tree, no reflash, no reboot.
+ *
+ * If i2c3 is ever genuinely needed (e.g. for a kernel driver), the only
+ * working route found so far is editing the board .dts and reflashing the
+ * boot partition (mmcblk1p4).
+ *
+ * Note the overlay deliberately does NOT set up pinmux or add a child device.
+ * It only re-enables the controller; autodetection at probe time is enough to
+ * see whether the sensor answers, and staying minimal keeps the risk of
+ * colliding with the camera path at zero.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+    /*
+     * The fragment target is looked up through the base tree's __symbols__,
+     * which does contain "i2c3" -> /i2c@ff460000. Using a label here rather
+     * than a raw path keeps this working if the address ever moves.
+     */
+    fragment@0 {
+        target = <&i2c3>;
+        __overlay__ {
+            status = "okay";
+        };
+    };
+};
