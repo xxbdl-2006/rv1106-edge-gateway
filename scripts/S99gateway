@@ -34,14 +34,36 @@
 # environment because it links the Rockit libraries from the same place.
 #
 #
-# Guarded by a flag because this script re-executes itself for the takeover:
-# RkEnv.sh appends to LD_LIBRARY_PATH, so sourcing it twice would add a second
-# copy of every path, and once per restart after that.
+# RkEnv.sh prepends "$HOME/usr/lib:$HOME/lib:" to LD_LIBRARY_PATH and this
+# script sources it once per invocation -- once per restart, plus once again in
+# the takeover worker it re-executes itself as. Each of those is a separate
+# process, so a shell flag cannot guard it: the flag is gone, the variable is
+# inherited already grown, and every restart prepends another copy. Left alone
+# the value reaches a dozen duplicates, which is ugly but also loads the same
+# directories repeatedly.
 #
-if [ -z "$GATEWAY_ENV_LOADED" ] && [ -f /etc/profile.d/RkEnv.sh ]; then
+# The paths are needed (the gateway links librkaiq from there), so the answer
+# is not to skip sourcing but to de-duplicate afterwards: keep the first
+# occurrence of each entry and drop the rest.
+dedup_path() {
+    _in="$1"
+    _out=""
+    _old_ifs="$IFS"
+    IFS=':'
+    for _p in $_in; do
+        case ":$_out:" in
+            *":$_p:"*) ;;
+            *) _out="${_out:+$_out:}$_p" ;;
+        esac
+    done
+    IFS="$_old_ifs"
+    echo "$_out"
+}
+
+if [ -f /etc/profile.d/RkEnv.sh ]; then
     . /etc/profile.d/RkEnv.sh
-    GATEWAY_ENV_LOADED=1
-    export GATEWAY_ENV_LOADED
+    LD_LIBRARY_PATH="$(dedup_path "$LD_LIBRARY_PATH")"
+    export LD_LIBRARY_PATH
 fi
 
 GATEWAY_BINARY="/userdata/v4l2_mpp_encode"
@@ -71,16 +93,6 @@ wait_for_path() {
     return 1
 }
 
-wait_for_process() {
-    waited=0
-    while [ "$waited" -lt 200 ]; do
-        pidof "$1" >/dev/null 2>&1 && return 0
-        waited=$((waited + 1))
-        sleep 0.1
-    done
-    return 1
-}
-
 # rkipc is only useful once it has actually opened the capture node: that is
 # when the sensor and the ISP are initialised.
 rkipc_is_streaming() {
@@ -100,6 +112,75 @@ wait_for_rkipc_streaming() {
         sleep 0.1
     done
     return 1
+}
+
+# Which process, if any, has the capture node open right now.
+#
+# Used to tell "nobody has initialised the camera yet" apart from "somebody
+# already has it", which is the difference between having to wait and being
+# able to start immediately. Prints the pid, or nothing when the node is free.
+capture_holder() {
+    for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        if ls -l "/proc/$pid/fd" 2>/dev/null | grep -q "$CAPTURE_DEVICE"; then
+            echo "$pid"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# The camera is ready once the capture node exists in /dev.
+#
+# This is the kernel side of the check: the node appears when the CIF/ISP
+# driver has probed the sensor, and it happens whether or not rkipc is
+# involved. Waiting on the node rather than on rkipc is what lets a restart
+# skip the wait entirely, because by then the node has long since appeared.
+wait_for_capture_node() {
+    waited=0
+    while [ "$waited" -lt 150 ]; do
+        [ -e "$CAPTURE_DEVICE" ] && return 0
+        waited=$((waited + 1))
+        sleep 0.2
+    done
+    return 1
+}
+
+# Wait for whoever owns the camera to finish initialising it, then take over.
+#
+# Two cases matter and they are not the same:
+#
+#   rkipc is running  - it is the one initialising the sensor, so wait until
+#                       it actually has the node open. Waiting on the process
+#                       alone is not enough: rkipc exists for a moment before
+#                       it touches the camera, and taking the node during that
+#                       window leaves the ISP half configured.
+#
+#   rkipc is absent   - either this is a restart, or the vendor startup chain
+#                       has not reached its rkipc line yet. In both cases
+#                       there is nothing to wait for. This is the case the
+#                       old code got wrong: it waited the full 20s every time
+#                       because it assumed rkipc was on its way.
+#
+# The pre-existing-holder case is handled by the caller, which must not take
+# the camera from a running gateway.
+camera_takeover_wait() {
+    if ! wait_for_capture_node; then
+        boot_log "$CAPTURE_DEVICE did not appear in 30s"
+        return 1
+    fi
+
+    if ! pidof rkipc >/dev/null 2>&1; then
+        boot_log "no rkipc, nothing is initialising the camera, proceeding"
+        return 0
+    fi
+
+    boot_log "rkipc is present, waiting for it to open $CAPTURE_DEVICE"
+    if wait_for_rkipc_streaming; then
+        boot_log "rkipc is streaming, taking the camera over"
+    else
+        boot_log "rkipc never opened $CAPTURE_DEVICE in 30s, continuing anyway"
+    fi
+    return 0
 }
 
 # Kill every process with this name.
@@ -189,12 +270,21 @@ takeover_task() {
         return 1
     fi
 
-    if ! wait_for_process rkipc; then
-        boot_log "rkipc never appeared in 20s, continuing anyway"
-    elif wait_for_rkipc_streaming; then
-        boot_log "rkipc is streaming on $CAPTURE_DEVICE, taking the camera over"
-    else
-        boot_log "rkipc never opened $CAPTURE_DEVICE in 30s, continuing anyway"
+    if ! camera_takeover_wait; then
+        boot_log "the camera never became usable, giving up"
+        return 1
+    fi
+
+    # Only rkipc is ours to kill. If anything else holds the node at this
+    # point it is another gateway instance that slipped past the pid file
+    # check, and killing a stranger would be worse than failing loudly.
+    holder=$(capture_holder)
+    if [ -n "$holder" ]; then
+        holder_name=$(cat "/proc/$holder/comm" 2>/dev/null)
+        if [ "$holder_name" != "rkipc" ]; then
+            boot_log "$CAPTURE_DEVICE is held by $holder ($holder_name), not taking it"
+            return 1
+        fi
     fi
 
     stop_by_name rkipc

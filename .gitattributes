@@ -5,4 +5,13 @@
 *.sh text eol=lf
 Makefile text eol=lf
 
+# Shell scripts that get pushed verbatim to the board. These are not named
+# *.sh, so the rules above do not cover them, and a CRLF copy is fatal: the
+# kernel reads the shebang as "#!/bin/sh\r" and refuses to run the script at
+# all, reporting only "not found". Force LF for every extensionless script
+# under scripts/ so an editor on Windows cannot break a board deployment.
+scripts/S99gateway text eol=lf
+scripts/gateway-supervise.sh text eol=lf
+scripts/soak-monitor.sh text eol=lf
+
 *.ps1 text eol=crlf

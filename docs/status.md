@@ -360,4 +360,103 @@ powercfg /change hibernate-timeout-ac 0
    不动），属预期成本而非泄漏。**收益是架构性的**：采集不再被编码/落盘拖累，
    为 OSD 与磁盘写入留出了头寸。
 2. Mock Sensor → OSD → 真实 MPU6050。
-3. 可选优化：`S99gateway restart` 白等 20 秒（接管前应先判断 rkipc 是否本就该不存在）。
+3. **✅ `S99gateway restart` 白等 20 秒已修复**（见 §7），并顺带修掉了
+   `LD_LIBRARY_PATH` 每次重启重复追加、以及 Windows 检出导致的 CRLF shebang 两个问题。
+
+---
+
+## 7. S99gateway restart 白等 20 秒：根因与修复（2026-09-28）
+
+### 现象与实测
+
+`/tmp/gateway-boot.log` 里两个场景的对比是决定性的：
+
+```
+开机     12:00:05 start requested
+         12:00:05 /userdata is ready
+         12:00:09 rkipc is streaming on /dev/video11, taking the camera over   ← 4 秒
+         12:00:16 gateway is up
+
+restart  12:01:32 start requested
+         12:01:32 /userdata is ready
+         12:01:55 rkipc never appeared in 20s, continuing anyway               ← 白等 23 秒
+         12:01:59 gateway is up
+```
+
+### 根因
+
+旧代码用 `wait_for_process rkipc` 等 rkipc **进程**出现（200 × 0.1s = 20 秒上限）。
+但 rkipc 只由 `S21appinit` → `/oem/usr/bin/RkLunch.sh`（其 `post_chk()` 的最后一行
+`rkipc -a /oem/usr/share/iqfiles &`）在**开机时启动一次**。restart 场景下：
+
+1. rkipc 早已被我们杀掉；
+2. `RkLunch.sh` 不会再跑（开机才跑一次）；
+3. 于是 rkipc 永远不会出现 → **必然**吃满 20 秒超时。
+
+顺带纠正一个此前记录中的错误假设：rkipc **不是**被改名成 K 开头禁用的，它是由
+`S21appinit` 正常拉起的。restart 时它不存在，纯粹是因为已经被杀且启动链不再触发。
+
+### 关键实测：rkipc 与摄像头就绪无关
+
+板端实测（uptime 13h39m、rkipc 完全不存在）下：
+- 网关持续推流正常，`Threads: 6`，CPU 21.4%（与长稳基线一致）；
+- `/dev/video11` 存在且**唯一占用者就是 `v4l2_mpp_encode` 自己**；
+- `rkaiq_3A_server` 独立工作，不依赖 rkipc。
+
+结论：**判据应该是"摄像头节点是否就绪"，而不是"rkipc 进程是否在"**。
+
+### 修法
+
+| 旧 | 新 |
+| --- | --- |
+| 等 rkipc 进程出现 | 先等 `/dev/video11` 节点出现（150 × 0.2s = 30s） |
+| 再等它 streaming | **仅当 rkipc 存在**时才等它 streaming；不在就直接进行 |
+| 无条件 `stop_by_name rkipc` | 先查 `capture_holder`，**占用者不是 rkipc 就拒绝接管**并 `return 1` |
+
+新增的三个函数：`capture_holder()`（查谁占着采集节点）、`wait_for_capture_node()`
+（等节点）、`camera_takeover_wait()`（组合判据）。第三个保护的意义在于：如果采集节点
+被一个**非 rkipc** 的进程占着，那多半是绕过 pid 文件检查的另一个网关实例，
+此时杀掉它比失败更糟，所以宁可大声失败。
+
+### 实测结果
+
+| | 修复前 | 修复后 |
+| --- | --- | --- |
+| `restart` 命令返回 | ~25s | **5s** |
+| takeover 全程 | 23s | **5s**（`01:43:36 → 01:43:41`） |
+| boot log 关键字 | `rkipc never appeared in 20s` | `no rkipc, nothing is initialising the camera, proceeding` |
+| 重启后推流 | — | **241 帧 / 8.03s / 30fps / 无误** |
+
+### 顺带修掉的两个问题
+
+**（1）`LD_LIBRARY_PATH` 每次重启重复追加。**
+`RkEnv.sh` 内容是 `export LD_LIBRARY_PATH=$HOME/usr/lib:$HOME/lib:$LD_LIBRARY_PATH`
+（**前置**追加），而 `S99gateway` 每次调用都会 source 它一次（restart 一次 + 它
+re-exec 出来的 takeover worker 再一次）。原代码用一个 `GATEWAY_ENV_LOADED` 环境变量
+做守卫，但**跨进程无效**：每次重启是新进程，标志丢了而变量被继承下来，于是每重启一次
+就多两份。实测已涨到 6 份：
+
+```
+LD_LIBRARY_PATH=/oem/usr/lib:/oem/lib:/oem/usr/lib:/oem/lib:/oem/usr/lib:/oem/lib:
+```
+
+修法不是跳过 source（这些路径确实要用），而是 source 之后**去重**：保留每项首次出现
+的顺序，丢掉重复项。实测连续 restart 三次，值稳定在 `/oem/usr/lib:/oem/lib` 不再增长。
+
+**（2）Windows 检出导致 CRLF shebang，脚本"not found"。**
+`scripts/S99gateway` 在工作区被写成 CRLF，`adb push` 原样送到板端后，内核把 shebang
+读成 `#!/bin/sh\r`，去执行一个名为 `/bin/sh` + CR 的解释器，于是报
+`/bin/sh: /etc/init.d/S99gateway: not found` —— 报的是"文件找不到"，而文件明明在，
+极具误导性。
+
+注意这个坑**本仓库已经埋好了防线但没覆盖到它**：`.gitattributes` 里有 `*.sh text eol=lf`，
+而 `S99gateway` **没有 `.sh` 后缀**，所以规则没管到它。已补上显式规则：
+
+```gitattributes
+scripts/S99gateway text eol=lf
+scripts/gateway-supervise.sh text eol=lf
+scripts/soak-monitor.sh text eol=lf
+```
+
+另外该文件在 git 里是 `100644`（非可执行位），而在板端必须是 `755`，所以部署后需要
+`chmod 755`。推送后建议核对 `head -c 12 | od -c` 确认是 `\n` 而非 `\r\n`。
