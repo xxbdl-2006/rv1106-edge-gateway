@@ -10,6 +10,14 @@
 /test-capture-thread.exe
 /test-mpu6050
 /test-mpu6050.exe
+/test-i2c-bitbang
+/test-i2c-bitbang.exe
+/test-sensor
+/test-sensor.exe
+/test-osd
+/test-osd.exe
+/test-osd-pipeline
+/test-osd-pipeline.exe
 /mpu6050-probe
 *.o
 *.nv12
@@ -21,3 +29,10 @@ core
 core.*
 datasheets/
 *.exe
+
+# Local record of what was removed from the board to free space, kept so a
+# deletion can be audited later. Not a project asset.
+.board-cleanup/
+
+# Previous board binary saved by verify-osd.sh before it overwrites it.
+/v4l2_mpp_encode.prev
