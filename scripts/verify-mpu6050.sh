@@ -115,6 +115,15 @@ build_binary() {
 # MUX UNCLAIMED is the precondition for the whole approach: a pin claimed by a
 # driver cannot be driven from userspace through sysfs, and the failure looks
 # like "the part never answers" rather than a permission error.
+#
+# This step also pins down the sysfs semantics the driver depends on. The one
+# that bit: writing `value` while a pin is an input fails with EPERM on Linux
+# ("write error: Operation not permitted"). A driver that sets the latch before
+# switching to output - the natural order for bare-metal open-drain - therefore
+# fails on its very first line_low, with 225 io errors and nothing on the bus,
+# while a Python implementation writing direction first works fine on the same
+# pins. That cost a debugging session, so the assumption is now checked
+# explicitly rather than assumed.
 # --------------------------------------------------------------------------
 check_board() {
     step "checking the board"
@@ -139,6 +148,41 @@ $mux
         ok "gateway is running (rtsp pipeline unaffected by this test)"
     else
         printf '  note: gateway not running; harmless for this test\n'
+    fi
+
+    check_sysfs_semantics
+}
+
+# Confirm that writing value works in the order the driver uses, and fails in
+# the order that looks natural but is wrong. Both halves matter: if the second
+# one ever starts succeeding, the ordering constraint has changed and the
+# comment in sysfs_line_low needs revisiting.
+check_sysfs_semantics() {
+    local probe="70"
+    local result
+
+    result="$(adb shell "
+        echo $probe > /sys/class/gpio/export 2>/dev/null
+        d=/sys/class/gpio/gpio$probe
+        echo out > \$d/direction 2>/dev/null
+        if echo 0 > \$d/value 2>/dev/null; then echo OUT_THEN_VALUE_OK; else echo OUT_THEN_VALUE_FAIL; fi
+        echo in > \$d/direction 2>/dev/null
+        if echo 0 > \$d/value 2>/dev/null; then echo IN_THEN_VALUE_OK; else echo IN_THEN_VALUE_FAIL; fi
+        echo in > \$d/direction 2>/dev/null
+        echo $probe > /sys/class/gpio/unexport 2>/dev/null
+    " 2>&1)"
+
+    printf '%s\n' "$result" | grep -q OUT_THEN_VALUE_OK \
+        || die "cannot write value after direction=out on gpio$probe:
+$result
+  The driver's line_low does exactly this. If it fails here it fails there."
+
+    if printf '%s\n' "$result" | grep -q IN_THEN_VALUE_OK; then
+        printf '  note: writing value while direction=in now succeeds.\n'
+        printf '        The ordering constraint documented in sysfs_line_low\n'
+        printf '        has changed on this kernel; the comment is stale.\n'
+    else
+        ok "sysfs ordering confirmed (out before value; in rejects writes)"
     fi
 }
 

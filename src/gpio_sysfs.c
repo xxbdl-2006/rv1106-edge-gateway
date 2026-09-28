@@ -213,14 +213,35 @@ static int sysfs_line_low(void *ctx, enum i2c_line line)
     struct gpio_pin *pin = pin_for(gpio, line);
 
     /*
-     * Order matters: set the output latch to 0 *before* switching the pin to
-     * output. Doing it the other way round briefly drives whatever the latch
-     * happened to hold, which on a shared bus can be a high pulse strong
-     * enough to confuse every other device on the wire.
+     * Direction first, then the value. This is forced by the kernel, and it is
+     * the opposite of what a bare-metal GPIO driver would do.
+     *
+     * Writing value while the pin is an input fails on Linux with EPERM
+     * ("write error: Operation not permitted" from the shell). The natural
+     * order for open-drain - set the latch to 0, then flip to output, so the
+     * pin never drives the stale latch value even for a moment - simply cannot
+     * be expressed here: the write fails, line_low returns -1, and the bus
+     * never comes up.
+     *
+     * That is exactly what happened on hardware. The symptom was 225 io errors
+     * and every address reporting "transport error" while the Python
+     * implementation, on the same pins and the same part, found 0x68 without
+     * complaint. The Python code writes direction first; that difference was
+     * the whole bug, and no compiler warning fires because there is no warning
+     * for "your GPIO write silently returned EPERM".
+     *
+     * The cost of the correct order is one transient: between direction=out
+     * and value=0 the pin drives whatever the latch last held. The kernel
+     * clears the output latch when a pin is set to input, and sysfs_gpio_open
+     * leaves both lines as inputs before the first START, so the stale value
+     * is low rather than high. Low is what a released I2C line looks like
+     * anyway, so the transient is harmless here - but it is worth knowing it
+     * exists, because on a pin whose latch could hold 1 it would be a narrow
+     * high pulse on the bus.
      */
-    if (write_attr(pin, pin->val_fd, "0") != 0)
-        return -1;
     if (pin_set_direction(pin, "out") != 0)
+        return -1;
+    if (write_attr(pin, pin->val_fd, "0") != 0)
         return -1;
     return 0;
 }
@@ -241,6 +262,24 @@ static int sysfs_line_read(void *ctx, enum i2c_line line)
     char buf[8];
     ssize_t n;
 
+    /*
+     * Reading a pin that is still configured as an output returns the latch we
+     * last wrote, not the voltage on the wire - the kernel does not sample the
+     * pad for us. Every ACK would then look like whatever we happened to send,
+     * which is a protocol bug that presents as a target that always replies
+     * "yes".
+     *
+     * The timing layer happens to release SDA before each read in read_byte,
+     * but that is a property of the current call sequence, not something this
+     * function can rely on. Asserting it here costs one redundant direction
+     * write on the paths where it is already an input - a few microseconds
+     * against a 25 us half period that the bus does not need anyway - and
+     * turns a subtle, timing-dependent corruption into a guaranteed-correct
+     * read.
+     */
+    if (pin_set_direction(pin, "in") != 0)
+        return -1;
+
     if (lseek(pin->val_fd, 0, SEEK_SET) < 0)
         return -1;
     n = read(pin->val_fd, buf, sizeof(buf) - 1);
@@ -248,13 +287,6 @@ static int sysfs_line_read(void *ctx, enum i2c_line line)
         return -1;
     buf[n] = '\0';
 
-    /*
-     * The pin must be an input for this read to mean anything. If it is still
-     * an output, the kernel reports the latch we last wrote rather than the
-     * voltage on the wire, and every ACK would look like whatever we sent.
-     * The timing layer is careful to release before every read, but asserting
-     * it here turns a subtle protocol bug into an obvious failure.
-     */
     return (buf[0] == '1') ? 1 : 0;
 }
 

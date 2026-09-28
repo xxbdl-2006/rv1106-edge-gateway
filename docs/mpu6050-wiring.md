@@ -639,6 +639,66 @@ mingw32-make: *** [Makefile:177: board-flags] Error 1
 不带 `-Isrc` 也能编过**？因为它们**住在 `src/` 里**，`#include "xxx.h"` 会先找
 **当前源文件所在目录** —— 而头就在同一个目录。`tools/` 下的文件没有这个便利。
 
+### 第六个：编过了、传上去了、跑起来了，然后 225 个 io error（本轮，真硅片上）
+
+修完 `-Isrc` 之后，流程终于走通：VM 编出 ARM 二进制（`e_machine=0x2800`）、
+adb 推上板、字节数核对一致、程序真的跑起来了。然后它**读不到任何寄存器**：
+
+```
+0x68: transport error (-2)
+... 共 112 个地址全部 transport error ...
+225 io error(s)
+```
+
+**第一步不是看 C 代码，是找对照**：同一块板、同样 gpio70/71、同一颗片子，
+`/userdata/i2c-bitbang.py`（Python 版，之前验证硬件时写的）**`found 0x68`，一切正常**。
+
+> 这是一个"把问题一分为二"的典型：Python 能过、C 不能过，且两者跑在同一块硅片上，
+> 那么**问题一定在两者实现不同的那一段**，不在硬件、不在接线、不在内核。
+> 没有这个对照，很可能会去怀疑上拉电阻或设备树，那是完全错误的方向。
+
+于是把差异缩小到 GPIO 的写序列。手工在板上做实验：
+
+```sh
+echo 70 > /sys/class/gpio/export
+d=/sys/class/gpio/gpio70
+echo out > $d/direction
+echo 0   > $d/value          # ← 成功
+echo in  > $d/direction
+echo 0   > $d/value          # ← 失败：write error: Operation not permitted
+```
+
+**根因**：Linux 的 sysfs GPIO，**在 `direction=in` 时写 `value` 会返回 EPERM**。
+而 `sysfs_line_low` 当时的顺序是「先写 value，再切 out」——
+**第一次调用时方向还是 `in`，所以那一写必然失败**，`line_low` 返回 -1，总线根本没起来。
+
+对照 Python 版（`tools/i2c-bitbang.py` 第 111-113 行）是「**先 out，再写 0**」——
+顺序正好相反。**这就是全部差异。**
+
+> **反直觉之处**：对裸机/寄存器级 GPIO 来说，"先设锁存器再切输出"才是正确顺序，
+> 否则切输出的一瞬间会驱动锁存器里的旧值，在共享总线上可能是根高速脉冲。
+> Linux sysfs **不允许**这么写，于是只能先切方向。
+> 代价是一个瞬态（切 out 到写 0 之间驱动旧锁存值），但内核在设为 input 时会清输出锁存器，
+> 且 `sysfs_gpio_open` 在第一个 START 之前把两根线都留成 input —— 所以这个瞬态是**低**，无害。
+
+**修复**（`src/gpio_sysfs.c`，两处）：
+
+1. `sysfs_line_low`：对调两行，`pin_set_direction(pin, "out")` 移到写 value 之前。
+2. `sysfs_line_read`：显式 `pin_set_direction(pin, "in")`。
+   读一个还是 output 的脚，内核返回的是**我们上次写的锁存值**而不是线上电平 ——
+   那样每个 ACK 都会读成"我们刚发的东西"，目标看起来永远在应答。
+   `read_byte` 当前恰好每次读之前都释放过 SDA，但那是**调用序列的性质，不是这个函数能依赖的**。
+
+**把假设变成检查**：`verify-mpu6050.sh` 新增 `check_sysfs_semantics()`，
+在板上显式验证"out 后写 value 成功、in 后写 value 失败"两半。
+两半都要 —— 如果哪天**第二半开始成功**，说明这个内核的顺序约束变了，
+`sysfs_line_low` 里那段注释就过期了，脚本会提醒。
+
+**教训**：**编译器不会因为「你的 GPIO 写悄悄返回 EPERM」而报警**。
+`-Wall -Wextra` 全绿、357 项主机测试全绿，总线依然可以是死的 ——
+因为没有任何一项主机测试碰得到内核的 sysfs 语义。
+**这类"跑在真设备上才暴露"的 bug，唯一有效的防线是在设备上做一次显式检查。**
+
 ---
 
 ## 8. 这个改动会影响线程化测试吗
@@ -664,11 +724,11 @@ mingw32-make: *** [Makefile:177: board-flags] Error 1
 |---|---|---|---|---|
 | test-packet-queue | 43 | 43 ✅ | 43 ✅ | 43 ✅ |
 | test-rtp-rtsp | 86 | 86 ✅ | 86 ✅ | 86 ✅ |
-| test-frame-ring | 64 | 64 ✅ | 64 ✅ | 64 ✅ |
+| test-frame-ring | 60 | 60 ✅ | 60 ✅ | 60 ✅ |
 | test-capture-thread | 13 | 13 ✅ | 13 ✅ | 13 ✅ |
 | test-mpu6050 | 68 | 68 ✅ | **105** ✅ | **105** ✅ |
 | test-i2c-bitbang | — | 50 ✅ | 50 ✅ | 50 ✅ |
-| **合计** | **274** | **324** | **361** | **361** |
+| **合计** | **270** | **320** | **357** | **357** |
 | `board-flags`（语法检查） | — | — | — | **新增** |
 
 > `board-flags` 不产生 assert 计数（它只做 `-fsyntax-only`），但它是
