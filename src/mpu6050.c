@@ -170,3 +170,95 @@ int mpu6050_decode_burst(const uint8_t *burst,
 
     return 0;
 }
+
+/*
+ * Guard against a caller that hands us scales from a different range than the
+ * biases were measured at. Comparing floats for exact equality is fine here
+ * and nowhere else: both sides are the same expression evaluated from the
+ * same constants, so either they are bit-identical or the caller really did
+ * configure another range.
+ */
+static int scale_matches(float scale, int fsr, int accel)
+{
+    float expected = accel ? mpu6050_accel_scale(fsr) : mpu6050_gyro_scale(fsr);
+
+    return scale == expected;
+}
+
+/*
+ * sqrt without libm.
+ *
+ * The target rootfs ships libc only, and one sqrt() drags in the whole of
+ * libm just to turn a check value into a number. Newton's method from a fixed
+ * seed converges to full float precision in well under twenty iterations for
+ * the range here (0 to a few g), and unlike a magic-constant bit hack it is
+ * obvious to a reader what it computes.
+ *
+ * Seeding from x0 = v is exact for v == 1 and converges for any v > 0; the
+ * guard matters because a zero or negative input would otherwise divide by
+ * zero on the first step.
+ */
+static float sqrt_newton(float v)
+{
+    float x;
+    int i;
+
+    if (v <= 0.0f)
+        return 0.0f;
+
+    x = v;
+    for (i = 0; i < 20; i++)
+        x = 0.5f * (x + v / x);
+
+    return x;
+}
+
+int mpu6050_apply_calibration(const struct mpu6050_sample *in,
+                              float accel_scale,
+                              float gyro_scale,
+                              struct mpu6050_calibrated *out)
+{
+    static const float accel_bias[3] = {
+        MPU6050_ACCEL_BIAS_X,
+        MPU6050_ACCEL_BIAS_Y,
+        MPU6050_ACCEL_BIAS_Z,
+    };
+    static const float gyro_bias[3] = {
+        MPU6050_GYRO_BIAS_X,
+        MPU6050_GYRO_BIAS_Y,
+        MPU6050_GYRO_BIAS_Z,
+    };
+    float sum_squares = 0.0f;
+    int i;
+
+    if (in == NULL || out == NULL)
+        return -1;
+    /*
+     * The structs are different types, so overlap has to be judged by address
+     * range rather than by pointer equality. Comparing in->accel_raw with
+     * out->accel_counts would be worse than useless: the array-to-pointer
+     * decay makes them different types, the comparison compiles, and it is
+     * always false.
+     */
+    if ((const void *)in == (const void *)out)
+        return -1;
+
+    if (!scale_matches(accel_scale, MPU6050_CAL_ACCEL_FSR, 1))
+        return -1;
+    if (!scale_matches(gyro_scale, MPU6050_CAL_GYRO_FSR, 0))
+        return -1;
+
+    for (i = 0; i < 3; i++) {
+        out->accel_counts[i] = (float)in->accel_raw[i] - accel_bias[i];
+        out->gyro_counts[i] = (float)in->gyro_raw[i] - gyro_bias[i];
+        out->accel_g[i] = out->accel_counts[i] * accel_scale;
+        out->gyro_dps[i] = out->gyro_counts[i] * gyro_scale;
+        sum_squares += out->accel_g[i] * out->accel_g[i];
+    }
+
+    out->accel_magnitude_g = sqrt_newton(sum_squares);
+    out->temp_c = in->temp_c;
+    out->timestamp_us = in->timestamp_us;
+
+    return 0;
+}

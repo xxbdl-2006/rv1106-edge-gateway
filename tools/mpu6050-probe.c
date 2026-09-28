@@ -13,6 +13,11 @@
  *   mpu6050-probe --scl 70 --sda 71 override the pins
  *   mpu6050-probe --delay 10        faster half period, in microseconds
  *
+ * --dump prints both the uncalibrated and the calibrated values. The pair is
+ * deliberate: the raw columns prove the bus and the decoding, and the
+ * calibrated ones prove the constants in src/mpu6050.h. A single column would
+ * leave it ambiguous which half is wrong when a number looks off.
+ *
  * Exits non-zero when nothing responds, so a shell script can branch on it.
  *
  * Why bit-bang rather than /dev/i2c-N: the i2c3 controller serving header pins
@@ -122,72 +127,147 @@ static int scan_bus(struct probe *p, int only_address)
     return found;
 }
 
-static void print_sample_row(int index, const struct mpu6050_sample *s)
+static void print_sample_row(int index, const struct mpu6050_sample *s,
+                             const struct mpu6050_calibrated *c)
 {
-    printf("%2d  %+7.3f %+7.3f %+7.3f   %+8.2f %+8.2f %+8.2f   %6.2f\n",
+    /*
+     * Both sets of numbers, side by side. The raw ones prove the bus and the
+     * decoding; the calibrated ones prove the constants. Printing only one of
+     * them would hide which half is wrong when a number looks off.
+     */
+    printf("%2d  %+7.3f %+7.3f %+7.3f  | %+7.3f %+7.3f %+7.3f  "
+           "| %+8.2f %+8.2f %+8.2f | %6.2f\n",
            index,
            (double)s->accel_g[0], (double)s->accel_g[1], (double)s->accel_g[2],
-           (double)s->gyro_dps[0], (double)s->gyro_dps[1],
-           (double)s->gyro_dps[2],
-           (double)s->temp_c);
+           (double)c->accel_g[0], (double)c->accel_g[1], (double)c->accel_g[2],
+           (double)c->gyro_dps[0], (double)c->gyro_dps[1],
+           (double)c->gyro_dps[2],
+           (double)c->temp_c);
 }
 
-static int dump_samples(struct mpu6050_imu *imu, int count)
+/*
+ * Square root by Newton iteration rather than sqrt(), so the probe needs no
+ * -lm and stays linkable on a rootfs that ships only libc. Guard the zero
+ * case: starting from 0 would divide by zero on the first step, and a sensor
+ * returning all zeros is exactly the failure this check is meant to report.
+ */
+static double sqrt_newton(double v)
 {
-    double sum_sq = 0.0;
+    double x;
+    int i;
 
-    printf("\n #  accel[g]            gyro[dps]           temp[C]\n");
+    if (v <= 0.0)
+        return 0.0;
+
+    x = v;
+    for (i = 0; i < 20; i++)
+        x = 0.5 * (x + v / x);
+
+    return x;
+}
+
+static int dump_samples(struct mpu6050_imu *imu,
+                        float accel_scale,
+                        float gyro_scale,
+                        int count)
+{
+    double sum_sq_raw = 0.0;
+    double sum_mag_cal = 0.0;
+    double sum_gyro[3] = { 0.0, 0.0, 0.0 };
+
+    printf("\n #  accel[g] raw               | accel[g] calibrated         "
+           "| gyro[dps] calibrated     | temp[C]\n");
     for (int i = 0; i < count; i++) {
         struct mpu6050_sample s;
+        struct mpu6050_calibrated c;
 
         if (mpu6050_read(imu, &s) != 0) {
             fprintf(stderr, "read failed: %s\n", strerror(errno));
             return -1;
         }
-        print_sample_row(i, &s);
+        if (mpu6050_apply_calibration(&s, accel_scale, gyro_scale, &c) != 0) {
+            fprintf(stderr,
+                    "calibration refused: the biases were measured at +/-2g /\n"
+                    "250 dps, so the configured range has to match.\n");
+            return -1;
+        }
+        print_sample_row(i, &s, &c);
 
-        for (int a = 0; a < 3; a++)
-            sum_sq += (double)s.accel_g[a] * (double)s.accel_g[a];
+        for (int a = 0; a < 3; a++) {
+            sum_sq_raw += (double)s.accel_g[a] * (double)s.accel_g[a];
+            sum_gyro[a] += (double)c.gyro_dps[a];
+        }
+        sum_mag_cal += (double)c.accel_magnitude_g;
 
         usleep(200000);
     }
 
     /*
-     * The magnitude, not the sum of squares. Whichever way the board is
+     * The magnitudes, not the sums of squares. Whichever way the board is
      * sitting, the three accelerometer axes must combine to about 1 g because
      * gravity is the only steady acceleration present. This is the single most
      * useful sanity check on a newly wired sensor: it exercises the full
-     * register map, the byte order and the scale factor at once, and the
-     * expected answer is known without any calibration.
+     * register map, the byte order and the scale factor at once.
      *
-     * Note the square root. Reporting the sum of squares under a "|a|" label
+     * Two of them, and the pair is the point. The uncalibrated one should read
+     * about 1.06 g on this part - the module leans, so some of g lands on X.
+     * The calibrated one must read 1.000 g, because the lean is exactly what
+     * the committed constants were measured to remove. If both are 1.06 the
+     * calibration silently did nothing; if the calibrated one is 0.000 the
+     * bias ate the gravity; and if the raw one were 1.00 the part is not the
+     * one the constants describe.
+     *
+     * Note the square roots. Reporting a sum of squares under a "|a|" label
      * reads as 1.05 g on a healthy sensor and looks plausible, which is
      * exactly why the mistake survives review.
      */
     {
-        double mean = sum_sq / (double)count;
-        double mag;
+        double mean_raw = sum_sq_raw / (double)count;
+        double mag_raw = sqrt_newton(mean_raw);
+        double mag_cal = sum_mag_cal / (double)count;
 
-        /*
-         * Square root by Newton iteration rather than sqrt(), so the probe
-         * needs no -lm and stays linkable on a rootfs that ships only libc.
-         * Guard the zero case: starting from 0 would divide by zero on the
-         * first step, and a sensor returning all zeros is exactly the failure
-         * this check is meant to report.
-         */
-        if (mean <= 0.0) {
-            mag = 0.0;
-        } else {
-            mag = mean;
-            for (int i = 0; i < 20; i++)
-                mag = 0.5 * (mag + mean / mag);
+        printf("\n|a| raw        = %.3f g (bench part reads ~1.062: it leans)\n",
+               mag_raw);
+        printf("|a| calibrated = %.3f g (expect ~1.000 at rest)\n", mag_cal);
+
+        if (mag_raw < 0.7 || mag_raw > 1.3) {
+            printf("      -> raw magnitude outside the band; check the range\n"
+                   "         setting and that the part is not being shaken\n");
+            return -1;
+        }
+        if (mag_cal < 0.9 || mag_cal > 1.1) {
+            printf("      -> calibrated magnitude is off. A value near 0 means\n"
+                   "         the bias absorbed gravity; a value near %.3f\n"
+                   "         means it was not applied at all\n",
+                   mag_raw);
+            return -1;
         }
 
-        printf("\n|a| = %.3f g (expect ~1.000 when the sensor is still)\n", mag);
-        if (mag < 0.7 || mag > 1.3) {
-            printf("      -> outside the expected band; check the range setting\n"
-                   "         and that the part is not being shaken\n");
-            return -1;
+        /*
+         * The gyro is the easier half and worth checking automatically: at
+         * rest it has no rate to report, so every calibrated axis must sit on
+         * zero. A mean well away from zero means either the part is being
+         * moved or the constants belong to a different sensor.
+         *
+         * The threshold is loose on purpose. Hand-holding a breadboard while
+         * the tool runs is normal and shows up as a few tenths of a dps; what
+         * this is meant to catch is a bias from another part, which is an
+         * order of magnitude larger.
+         */
+        printf("gyro[dps] means: %+.3f %+.3f %+.3f\n",
+               sum_gyro[0] / (double)count,
+               sum_gyro[1] / (double)count,
+               sum_gyro[2] / (double)count);
+        for (int a = 0; a < 3; a++) {
+            double mean_gyro = sum_gyro[a] / (double)count;
+
+            if (mean_gyro < -2.0 || mean_gyro > 2.0) {
+                printf("      -> axis %d sits at %+.2f dps when it should be\n"
+                       "         near zero; the part may be moving, or these\n"
+                       "         constants may belong to another sensor\n",
+                       a, mean_gyro);
+                return -1;
+            }
         }
     }
     return 0;
@@ -202,7 +282,10 @@ static void usage(const char *argv0)
             "  --delay N    half period in microseconds (default 25)\n"
             "  --addr A     probe only this 7-bit address\n"
             "  --dump       read and print samples after a successful probe\n"
-            "  --count N    samples to print in --dump mode (default 10)\n",
+            "  --count N    samples to print in --dump mode (default 10)\n"
+            "\n--dump prints raw and calibrated values side by side, and checks\n"
+            "both magnitudes: the raw one reads ~1.062 g on this bench part\n"
+            "because the module leans, the calibrated one must read 1.000 g.\n",
             argv0);
 }
 
@@ -323,7 +406,10 @@ int main(int argc, char **argv)
                        "           output registers are layout-compatible\n");
         }
 
-        if (dump_samples(imu, count) != 0)
+        if (dump_samples(imu,
+                         mpu6050_accel_scale(cfg.accel_fsr),
+                         mpu6050_gyro_scale(cfg.gyro_fsr),
+                         count) != 0)
             exit_code = 1;
 
         mpu6050_close(imu);

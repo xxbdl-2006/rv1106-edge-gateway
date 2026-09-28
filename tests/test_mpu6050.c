@@ -325,6 +325,280 @@ static void test_giant_values(void)
     CHECK(close_to(s.accel_g[0], 0.0f, 1e-9f), "zero scale -> 0 g");
 }
 
+/* ------------------------------------------------------------------------ */
+/* Calibration                                                               */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Build a sample for a level part: the given acceleration along Z, nothing on
+ * X and Y.
+ *
+ * This exists because writing it inline three times got it wrong three times.
+ * "No acceleration on X" is not a raw count of zero: the part outputs its
+ * offset when at rest, so a level axis reads MPU6050_ACCEL_BIAS_X counts. A
+ * zero here would mean +0.16 g of real motion on this particular sensor, and
+ * the resulting magnitude assertions would fail for a reason that has nothing
+ * to do with the code under test.
+ */
+static void make_level_sample(uint8_t *burst, float z_g)
+{
+    int16_t ax = (int16_t)(MPU6050_ACCEL_BIAS_X + (MPU6050_ACCEL_BIAS_X < 0 ? -0.5f : 0.5f));
+    int16_t ay = (int16_t)(MPU6050_ACCEL_BIAS_Y + (MPU6050_ACCEL_BIAS_Y < 0 ? -0.5f : 0.5f));
+    int16_t az = (int16_t)(z_g * 16384.0f + MPU6050_ACCEL_BIAS_Z + 0.5f);
+
+    make_burst(burst, ax, ay, az, 3882, 0, 0, 0);
+}
+
+/*
+ * The anchor case: the exact 100-sample mean the committed biases came from,
+ * fed back through the correction. A correct implementation must land on
+ * zero for every axis of the gyro, because a part at rest has no rotation and
+ * the whole mean was therefore offset.
+ */
+static void test_calibration_removes_gyro_bias(void)
+{
+    printf("calib: gyro at rest cancels\n");
+
+    uint8_t burst[MPU6050_BURST_LEN];
+    struct mpu6050_sample s;
+    struct mpu6050_calibrated c;
+
+    make_burst(burst, -2639, -67, 17195, 3882, 553, -612, -240);
+    CHECK(mpu6050_decode_burst(burst, sizeof(burst),
+                               mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                               mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR),
+                               &s) == 0, "decode ok");
+    CHECK(mpu6050_apply_calibration(&s,
+                                    mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                                    mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR),
+                                    &c) == 0, "apply ok");
+
+    /* Raw counts were integers rounded from the mean, so allow the LSB of
+     * that rounding: 0.36 counts and a fraction of a dps. */
+    CHECK(close_to(c.gyro_dps[0], 0.0f, 0.01f), "gyro x -> 0, got %f",
+          c.gyro_dps[0]);
+    CHECK(close_to(c.gyro_dps[1], 0.0f, 0.01f), "gyro y -> 0, got %f",
+          c.gyro_dps[1]);
+    CHECK(close_to(c.gyro_dps[2], 0.0f, 0.01f), "gyro z -> 0, got %f",
+          c.gyro_dps[2]);
+}
+
+/*
+ * The mistake this test exists to catch, and it is a subtle one because it
+ * passes every other check: subtracting the raw accelerometer mean instead of
+ * the mean minus gravity. The gyro case above cannot see it - gyro really does
+ * read zero at rest - and the magnitude check would still be near 1.0 if only
+ * one axis were wrong in a compensating way.
+ *
+ * The input has to be what the part actually reports at rest, not a round
+ * number: a level part reads 16384 counts of gravity *plus* its own offset, so
+ * the raw Z count is 16384 + MPU6050_ACCEL_BIAS_Z. Feeding 16384 instead and
+ * expecting 1.0 g would be testing that the bias is not applied at all.
+ */
+static void test_calibration_preserves_gravity(void)
+{
+    printf("calib: gravity survives the correction\n");
+
+    uint8_t burst[MPU6050_BURST_LEN];
+    struct mpu6050_sample s;
+    struct mpu6050_calibrated c;
+
+    make_level_sample(burst, 1.0f);
+    CHECK(mpu6050_decode_burst(burst, sizeof(burst),
+                               mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                               mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR),
+                               &s) == 0, "decode ok");
+    CHECK(mpu6050_apply_calibration(&s,
+                                    mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                                    mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR),
+                                    &c) == 0, "apply ok");
+
+    CHECK(close_to(c.accel_g[2], 1.0f, 0.001f),
+          "level part must still read 1 g, got %f", c.accel_g[2]);
+    CHECK(!close_to(c.accel_g[2], 0.0f, 0.001f),
+          "gravity was subtracted: the bias ate the measurement");
+    CHECK(close_to(c.accel_magnitude_g, 1.0f, 0.001f),
+          "magnitude 1 g, got %f", c.accel_magnitude_g);
+
+    /*
+     * The converse, and the one that isolates the bug: at rest the part reads
+     * gravity plus offset, and subtracting the raw mean would zero that axis.
+     * So the raw reading must NOT come out as 0 g after correction.
+     */
+    CHECK(close_to(c.accel_counts[2], 16384.0f, 1.0f),
+          "corrected Z count keeps the 1 g, got %f", c.accel_counts[2]);
+}
+
+/*
+ * accel_magnitude_g is computed with a local Newton iteration rather than
+ * libm, because the target rootfs has no libm. This test is what makes that
+ * safe: the same input through the real sqrtf must agree. If someone later
+ * "optimises" the iteration down to two rounds, this fails immediately while
+ * every other test still passes.
+ *
+ * It also pins the documented end-to-end result: the bench part at rest used
+ * to read 1.0618 g, and after correction it must read 1.000.
+ */
+static void test_calibration_magnitude_matches_libm(void)
+{
+    printf("calib: newton sqrt agrees with libm\n");
+
+    /*
+     * Stay inside what an int16 can express at +/-2 g: 32767 counts is 2.0 g,
+     * so anything above that would be silently truncated by the cast and the
+     * test would be measuring integer overflow rather than sqrt accuracy. The
+     * range that matters for the iteration is the range that can occur.
+     */
+    static const float targets[] = { 0.01f, 0.5f, 1.0f, 1.0618f, 1.9f };
+    size_t i;
+
+    for (i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
+        /*
+         * Reach the internal helper the only way a caller can: craft a sample
+         * whose corrected magnitude is the target. A level part with the given
+         * Z does it - see make_level_sample for why the other axes sit at
+         * their offsets rather than at zero.
+         */
+        uint8_t burst[MPU6050_BURST_LEN];
+        struct mpu6050_sample s;
+        struct mpu6050_calibrated c;
+
+        make_level_sample(burst, targets[i]);
+        mpu6050_decode_burst(burst, sizeof(burst),
+                             mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                             mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR), &s);
+        CHECK(mpu6050_apply_calibration(&s,
+                                        mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                                        mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR),
+                                        &c) == 0, "apply ok");
+
+        /* The crafted int16 rounds, which is 6e-5 g per LSB; the iteration's
+         * own error is far below that. */
+        CHECK(close_to(c.accel_magnitude_g, targets[i], 1e-3f),
+              "newton sqrt for %f g returned %f", targets[i],
+              c.accel_magnitude_g);
+        CHECK(close_to(c.accel_magnitude_g,
+                       sqrtf(c.accel_g[0] * c.accel_g[0] +
+                             c.accel_g[1] * c.accel_g[1] +
+                             c.accel_g[2] * c.accel_g[2]),
+                       1e-4f),
+              "newton sqrt disagrees with libm at %f g", targets[i]);
+    }
+
+    /* And the documented bench figure, from the real mean. */
+    {
+        uint8_t burst[MPU6050_BURST_LEN];
+        struct mpu6050_sample s;
+        struct mpu6050_calibrated c;
+
+        make_burst(burst, -2639, -67, 17195, 3882, 553, -612, -240);
+        mpu6050_decode_burst(burst, sizeof(burst),
+                             mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                             mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR), &s);
+        mpu6050_apply_calibration(&s,
+                                  mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                                  mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR), &c);
+        CHECK(close_to(c.accel_magnitude_g, 1.0f, 0.005f),
+              "bench part reads 1.000 g after correction, got %f",
+              c.accel_magnitude_g);
+    }
+}
+
+/*
+ * The biases are raw counts, so they only mean anything at the range they were
+ * measured with. A caller that configures +/-16 g and still subtracts them
+ * would apply a correction 8x too large, with no error anywhere. Refusing is
+ * the only safe answer, because the offsets would have to be rescaled and the
+ * caller is the only one who knows the intent.
+ */
+static void test_calibration_rejects_wrong_fsr(void)
+{
+    printf("calib: refuses a mismatched full scale\n");
+
+    uint8_t burst[MPU6050_BURST_LEN];
+    struct mpu6050_sample s;
+    struct mpu6050_calibrated c;
+
+    make_burst(burst, 0, 0, 16384, 0, 0, 0, 0);
+    mpu6050_decode_burst(burst, sizeof(burst),
+                         mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                         mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR), &s);
+
+    CHECK(mpu6050_apply_calibration(&s, mpu6050_accel_scale(MPU6050_FSR_ACCEL_16G),
+                                    mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR),
+                                    &c) == -1, "accel at 16 g refused");
+    CHECK(mpu6050_apply_calibration(&s, mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                                    mpu6050_gyro_scale(MPU6050_FSR_GYRO_2000),
+                                    &c) == -1, "gyro at 2000 dps refused");
+    CHECK(mpu6050_apply_calibration(&s, 0.0f,
+                                    mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR),
+                                    &c) == -1, "zero scale refused");
+    CHECK(mpu6050_apply_calibration(&s, mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                                    mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR),
+                                    &c) == 0, "matching scales accepted");
+}
+
+static void test_calibration_rejects_bad_args(void)
+{
+    printf("calib: argument validation\n");
+
+    struct mpu6050_sample s;
+    struct mpu6050_calibrated c;
+
+    memset(&s, 0, sizeof(s));
+
+    CHECK(mpu6050_apply_calibration(NULL,
+                                    mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                                    mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR),
+                                    &c) == -1, "null input refused");
+    CHECK(mpu6050_apply_calibration(&s,
+                                    mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                                    mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR),
+                                    NULL) == -1, "null output refused");
+
+    /*
+     * Self-alias would overwrite the raw counts it is still reading. The
+     * structs differ in type, so this is the one case that catches an
+     * implementation testing the wrong thing: the natural (and wrong) check is
+     * `in->accel_raw == out->accel_counts`, which decays to different types
+     * and is therefore always false - so it compiles, and it never fires.
+     */
+    {
+        union {
+            struct mpu6050_sample s;
+            struct mpu6050_calibrated c;
+        } alias;
+        memset(&alias, 0, sizeof(alias));
+        CHECK(mpu6050_apply_calibration(&alias.s,
+                                        mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                                        mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR),
+                                        &alias.c) == -1,
+              "overlapping in/out refused");
+    }
+}
+
+/* Temperature has no at-rest offset, so it must come through bit for bit. */
+static void test_calibration_passes_temperature_through(void)
+{
+    printf("calib: temperature is not touched\n");
+
+    uint8_t burst[MPU6050_BURST_LEN];
+    struct mpu6050_sample s;
+    struct mpu6050_calibrated c;
+
+    make_burst(burst, 0, 0, 16384, 3882, 0, 0, 0);
+    mpu6050_decode_burst(burst, sizeof(burst),
+                         mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                         mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR), &s);
+    mpu6050_apply_calibration(&s, mpu6050_accel_scale(MPU6050_CAL_ACCEL_FSR),
+                              mpu6050_gyro_scale(MPU6050_CAL_GYRO_FSR), &c);
+
+    CHECK(c.temp_c == s.temp_c, "temperature unchanged");
+    CHECK(c.timestamp_us == s.timestamp_us, "timestamp unchanged");
+    CHECK(close_to(c.temp_c, 47.95f, 0.02f), "bench temperature ~47.95 C, got %f",
+          c.temp_c);
+}
+
 int main(void)
 {
     printf("=== MPU6050 decoding tests ===\n");
@@ -339,6 +613,12 @@ int main(void)
     test_rejects_short_burst();
     test_zero_sample_on_failure();
     test_giant_values();
+    test_calibration_removes_gyro_bias();
+    test_calibration_preserves_gravity();
+    test_calibration_magnitude_matches_libm();
+    test_calibration_rejects_wrong_fsr();
+    test_calibration_rejects_bad_args();
+    test_calibration_passes_temperature_through();
 
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0)

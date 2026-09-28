@@ -135,6 +135,13 @@ struct mpu6050_config {
  * One decoded sample. Raw counts are kept alongside the scaled values so a
  * caller can log exactly what the part said, and so a regression shows up as
  * a changed raw value rather than a rounding difference in the scaled one.
+ *
+ * accel_g / gyro_dps are the *uncalibrated* values: raw counts times the
+ * datasheet sensitivity, nothing more. Calibration is a separate, optional
+ * step - see mpu6050_apply_calibration() and the sample struct it fills.
+ * Keeping the two apart means a decoding bug and a calibration bug cannot
+ * disguise each other, and a caller that never calibrates still gets sane
+ * numbers.
  */
 struct mpu6050_sample {
     /* Raw signed counts, straight off the bus. */
@@ -149,6 +156,119 @@ struct mpu6050_sample {
 
     uint64_t timestamp_us;
 };
+
+/* ------------------------------------------------------------------------ */
+/* Calibration                                                               */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Sensor-frame offsets, measured once on the bench and then frozen.
+ *
+ * Why these are compile-time constants and not a file: the values describe
+ * this one physical part, the part does not move between builds, and a
+ * constant cannot go missing from the rootfs at boot. A config file would add
+ * a runtime failure mode (missing, unreadable, stale after a module swap) in
+ * exchange for nothing this project needs yet. When more than one board is in
+ * play this becomes a per-serial table; that day is not today.
+ *
+ * How they were measured: 100 samples at rest, module still, raw counts
+ * averaged per axis.
+ *
+ *   accel mean   -2639.36 /  -67.48 / 17194.92 counts
+ *   gyro  mean     552.52 / -611.66 /  -240.35 counts
+ *   accel |mean|            1.0618 g
+ *   temp mean               3882.30 -> 47.95 C
+ *
+ * The accelerometer biases are NOT the raw means, and getting this wrong is
+ * the classic accelerometer blunder. At rest the part reads gravity, so the
+ * mean along the vertical axis is ~1 g of signal plus a small offset. Subtracting
+ * the raw mean would cancel the gravity too, leaving a perfectly level sensor
+ * reporting 0.00 g on every axis and an attitude estimate that never
+ * converges. Only the part that is not gravity belongs in the bias:
+ *
+ *   z: 17194.92 - 16384 = 810.92 counts of genuine offset
+ *
+ * The gyroscope is the opposite case. It measures rate, it reads zero at rest,
+ * so its raw mean is entirely offset and is subtracted as-is.
+ *
+ * A caveat worth writing down, because it is the next thing to fix: the
+ * remaining -2639.36 / -67.48 on X and Y is *mostly not electrical*. It is the
+ * module leaning. asin(2639/16384) = 9.3 degrees on X, asin(67/16384) = 0.24
+ * degrees on Y, and the MPU6050 breakout sits on vertical header pins, so of
+ * course it leans. Treating that lean as zero offset means these constants are
+ * correct only while the module stays at this mounting angle - which it will,
+ * for now, and which is why they are committed rather than left to a runtime
+ * routine that would have to guess whether stillness meant "level" or "tilted".
+ * A proper six-face tumble separates the two; it is not worth doing until the
+ * mount is final.
+ */
+#define MPU6050_ACCEL_BIAS_X (-2639.36f)
+#define MPU6050_ACCEL_BIAS_Y (-67.48f)
+#define MPU6050_ACCEL_BIAS_Z (810.92f) /* 17194.92 - 16384, i.e. less 1 g */
+
+#define MPU6050_GYRO_BIAS_X (552.52f)
+#define MPU6050_GYRO_BIAS_Y (-611.66f)
+#define MPU6050_GYRO_BIAS_Z (-240.35f)
+
+/*
+ * Which FSR the biases above were measured at. They are raw counts, so they
+ * only mean anything at the range they were taken with. Applying them under a
+ * different range silently applies a wrong correction, so the applier checks.
+ */
+#define MPU6050_CAL_ACCEL_FSR MPU6050_FSR_ACCEL_2G
+#define MPU6050_CAL_GYRO_FSR  MPU6050_FSR_GYRO_250
+
+/*
+ * One calibrated sample: what the part said, minus the offset we know is not
+ * physics - but with gravity deliberately preserved.
+ *
+ * The accelerometer output still reads ~1 g along the vertical axis, because
+ * that 1 g is the measurement, not an error. What the bias removes is the
+ * residual offset around it. A caller that wants a gravity-free vector (to
+ * integrate acceleration, say) subtracts the gravity direction itself, which
+ * requires knowing the orientation - something this struct cannot know.
+ *
+ * Both the offset-corrected counts and the scaled result are kept, so a caller
+ * can log either and so the scaling can be re-derived without re-reading.
+ */
+struct mpu6050_calibrated {
+    /* accel_raw[] - bias, in counts. Rises to ~16384 at rest on the vertical. */
+    float accel_counts[3];
+    float gyro_counts[3];
+
+    /* counts * scale: g and deg/s, with the offset removed. */
+    float accel_g[3];
+    float gyro_dps[3];
+
+    /*
+     * |accel_g| after correction. At rest this is the single best signal that
+     * the calibration is sane: it must be 1.000, not 0.000 (bias ate the
+     * gravity) and not 1.06 (bias not applied at all). Computed here because
+     * every caller would otherwise reimplement it and the rootfs has no libm.
+     */
+    float accel_magnitude_g;
+
+    /* Raw temperature passes through untouched; it has no at-rest offset. */
+    float temp_c;
+
+    uint64_t timestamp_us;
+};
+
+/*
+ * Remove the bias above from a decoded sample.
+ *
+ * accel_scale / gyro_scale must be the ones the sample was decoded with, and
+ * they are checked against MPU6050_CAL_ACCEL_FSR / _GYRO_FSR: the bias is in
+ * counts, so applying it at another range would subtract the right number of
+ * the wrong unit. Returns 0 on success, -1 if the scales disagree with what
+ * the biases were measured at (and then leaves out untouched).
+ *
+ * out may alias nothing; in and out must be distinct.
+ */
+int mpu6050_apply_calibration(const struct mpu6050_sample *in,
+                              float accel_scale,
+                              float gyro_scale,
+                              struct mpu6050_calibrated *out);
 
 /* ------------------------------------------------------------------------ */
 /* Decoding layer: no I/O, no Linux headers, fully host testable.            */
