@@ -139,8 +139,14 @@ for d in /proc/device-tree/i2c@*; do echo "$d: $(cat $d/status 2>/dev/null)"; do
 | AD0 | GND 或 3V3 | 决定地址 `0x68` / `0x69` |
 | INT | 任意 GPIO（如 pin 28/30/32） | 可选 |
 
-**前置条件**：需先把设备树里的 `i2c3` 从 `disabled` 改为 `okay` 并重刷固件，
-否则 `/dev/i2c-3` 不存在、扫描不到。
+**前置条件**：**不需要改设备树、不需要重刷固件**。
+`i2c3` 在设备树里确实是 `disabled`，但正因为如此它的 pinctrl 没被 claim ——
+pin 70/71（= 排针 pin 24/14）`MUX UNCLAIMED`，可以用**纯用户态 GPIO 位翻转**驱动。
+**已上板跑通**（2026-09-28：`0x68: present`、`0 io error(s)`）。
+
+> 早期版本这里写的是"必须先启用 i2c3 并重刷固件"。**那是错的，且运行时 device-tree
+> overlay 在这块板子上也是坏的**（已实测证伪）。详见
+> [`mpu6050-wiring.md`](./mpu6050-wiring.md) §3.5 与 §4。
 
 参见 [`mpu6050-wiring.md`](./mpu6050-wiring.md)。
 

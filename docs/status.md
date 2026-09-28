@@ -3,7 +3,7 @@
 本文档记录每一项已完成的验收、实测数据和踩过的坑。`docs/handoff.md` 描述架构和
 交接要求，本文档描述**实际测到了什么**。两者冲突时以本文档的实测数据为准。
 
-最后更新：2026-09-27
+最后更新：2026-09-28
 
 ---
 
@@ -359,7 +359,12 @@ powercfg /change hibernate-timeout-ac 0
    （1280×720×1.5 字节/槽 ≈ 4.15MB）的固定开销**，与时长无关（8 小时后仍在 16,284 KB
    不动），属预期成本而非泄漏。**收益是架构性的**：采集不再被编码/落盘拖累，
    为 OSD 与磁盘写入留出了头寸。
-2. Mock Sensor → OSD → 真实 MPU6050。
+2. **✅ MPU6050 C 版已上板读通**（2026-09-28，见 `docs/mpu6050-wiring.md` §6/§7）：
+   `0x68: present` + `WHO_AM_I=0x70 (MPU6500)` + **`0 io error(s)`** +
+   `|a| raw 1.056 / calibrated 0.996`，与 Python 黄金对照逐项一致。
+   过程中修掉了两个只有真设备才暴露的 bug：缺 `-Isrc`（主机检查标志与真实构建不一致）
+   与 **sysfs GPIO 写序**（`direction=in` 时写 `value` 返回 EPERM → 225 个 io error）。
+   下一步：Mock Sensor → OSD。
 3. **✅ `S99gateway restart` 白等 20 秒已修复**（见 §7），并顺带修掉了
    `LD_LIBRARY_PATH` 重复追加（`S99gateway` 与 `gateway-supervise.sh` **两处都有**）、
    以及 Windows 检出导致的 CRLF shebang 问题。
