@@ -46,6 +46,7 @@ BOARD_DIR="/userdata"
 
 SECONDS_OF_SAMPLES="${SECONDS_OF_SAMPLES:-20}"
 CLIP_FRAMES="${CLIP_FRAMES:-300}"
+ADB_WAIT_S="${ADB_WAIT_S:-150}"
 
 WORK_DIR="$REPO_DIR/.imu-verify"
 IMU_LOG="$WORK_DIR/imu-sample.log"
@@ -67,14 +68,39 @@ to_native_path() {
     fi
 }
 
+# The USB link to this board drops on its own, and it has now done so twice in
+# the middle of a run - once right after the 3A server was started. It is a
+# link problem, not a software one, and replugging brings it back within half a
+# minute. Dying on the first miss means the run has to be driven again from the
+# top, and worse, leaves the gateway stopped; waiting means a replug that
+# happens while this is running just works.
+#
+# The hint is printed once, not every second, because the person being asked to
+# replug cannot act faster than that and a screen full of it reads as a crash.
 require_adb() {
-    adb devices 2>/dev/null | grep -q 'device$' && return 0
-    printf '\nFAILED: the USB link to the board is gone (no adb device).\n' >&2
-    printf '  This is a physical/link problem, not a software one. Check whether\n' >&2
-    printf '  the RNDIS adapter is still present; if it is gone, replug the board.\n' >&2
-    printf '  Then, if the gateway did not come back:\n' >&2
-    printf '      adb shell "/etc/init.d/S99gateway start"\n' >&2
-    exit 1
+    local waited=0 hinted=0
+
+    while :; do
+        adb devices 2>/dev/null | grep -q 'device$' && return 0
+
+        if [ "$hinted" = "0" ]; then
+            printf '\nThe board is not answering over USB.\n' >&2
+            printf '  If the cable is seated, just wait; if the RNDIS adapter is gone,\n' >&2
+            printf '  replug the board. Waiting up to %s s.\n' "$ADB_WAIT_S" >&2
+            hinted=1
+        fi
+
+        if [ "$waited" -ge "$ADB_WAIT_S" ]; then
+            printf '\nFAILED: no adb device after %s s.\n' "$ADB_WAIT_S" >&2
+            printf '  This is a physical/link problem, not a software one.\n' >&2
+            printf '  After replugging, if the gateway did not come back:\n' >&2
+            printf '      adb shell "/etc/init.d/S99gateway start"\n' >&2
+            exit 1
+        fi
+
+        sleep 2
+        waited=$((waited + 2))
+    done
 }
 
 on_board_running() {
@@ -130,8 +156,12 @@ check_artifacts() {
         ok "$f is ARM ($(wc -c < "$REPO_DIR/$f") bytes)"
     done
 
+    # -kP: POSIX output, one line per mount, columns in a defined order. The
+    # plain form on this board put something other than the free count in
+    # field 4, which printed "2% KB free" and quietly skipped the check.
     local free_kb
-    free_kb="$(adb shell "df /userdata | tail -1" 2>/dev/null | tr -d '\r' | awk '{print $4}')"
+    free_kb="$(adb shell "df -kP /userdata | tail -1" 2>/dev/null | tr -d '\r' \
+        | awk '{print $4}')"
     if [ -n "$free_kb" ] && [ "$free_kb" -lt 20480 ] 2>/dev/null; then
         die "only ${free_kb} KB free on /userdata; a clip needs a few MB. Clear
   the debug files first (this partition has filled up before)."
@@ -237,9 +267,21 @@ push_binary() {
 
     local_size="$(wc -c < "$REPO_DIR/$name")"
 
-    adb push "$(to_native_path "$REPO_DIR/$name")" "$BOARD_DIR/" >/dev/null 2>&1 \
-        || die "adb push $name failed"
-    board_size="$(adb shell "wc -c < $BOARD_DIR/$name" 2>/dev/null | tr -d '\r')"
+    # Retried because the link drops mid transfer: a push that fails leaves a
+    # truncated file on the board, which is why the size is checked below
+    # rather than trusted.
+    local attempt=0
+    while :; do
+        adb push "$(to_native_path "$REPO_DIR/$name")" "$BOARD_DIR/" >/dev/null 2>&1
+        board_size="$(adb shell "wc -c < $BOARD_DIR/$name" 2>/dev/null | tr -d '\r')"
+        [ "$local_size" = "$board_size" ] && break
+
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 3 ]; then
+            break
+        fi
+        require_adb || exit 1
+    done
 
     if [ "$local_size" != "$board_size" ]; then
         die "size mismatch after pushing $name: local $local_size, board $board_size.

@@ -31,6 +31,7 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY="v4l2_mpp_encode"
 BOARD_DIR="/userdata"
 FRAMES="${1:-300}"
+ADB_WAIT_S="${ADB_WAIT_S:-150}"
 
 WORK_DIR="$REPO_DIR/.fps-compare"
 GATEWAY_WAS_RUNNING=0
@@ -39,6 +40,39 @@ step() { printf '\n=== %s ===\n' "$*"; }
 ok()   { printf '  ok   %s\n' "$*"; }
 note() { printf '  note %s\n' "$*"; }
 die()  { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
+
+# e_machine at offset 18; 0x28 is ARM. An x86 binary pushed to the board fails
+# in a way that points at the code rather than at the build.
+check_elf() {
+    local machine
+    machine="$(od -An -tx1 -j18 -N2 "$1" 2>/dev/null | tr -d ' \n')"
+    [ "$machine" = "2800" ]
+}
+
+# The USB link drops on its own and has taken a run with it twice. Waiting for
+# it to come back beats dying, because a replug that happens while this script
+# is sitting here just works. See the longer comment in verify-imu.sh.
+require_adb() {
+    local waited=0 hinted=0
+
+    while :; do
+        adb devices 2>/dev/null | grep -q 'device$' && return 0
+
+        if [ "$hinted" = "0" ]; then
+            printf '\nThe board is not answering over USB. Replug it if the\n' >&2
+            printf '  RNDIS adapter is gone; waiting up to %s s.\n' "$ADB_WAIT_S" >&2
+            hinted=1
+        fi
+
+        if [ "$waited" -ge "$ADB_WAIT_S" ]; then
+            printf '\nFAILED: no adb device after %s s.\n' "$ADB_WAIT_S" >&2
+            return 1
+        fi
+
+        sleep 2
+        waited=$((waited + 2))
+    done
+}
 
 on_board_running() {
     local pid
@@ -187,17 +221,28 @@ main() {
     mkdir -p "$WORK_DIR"
 
     step "preconditions"
-    adb devices 2>/dev/null | grep -q 'device$' \
-        || die "no adb device. Check the USB link before blaming the software."
+    require_adb || exit 1
     [ -f "$REPO_DIR/$BINARY" ] \
         || die "$BINARY is missing; build it in the VM first."
+    check_elf "$REPO_DIR/$BINARY" \
+        || die "$BINARY is not ARM. Rebuild with CROSS_COMPILE set."
 
     stop_gateway
 
-    adb push "$(cygpath -m "$REPO_DIR/$BINARY" 2>/dev/null || printf '%s' "$REPO_DIR/$BINARY")" \
-        "$BOARD_DIR/" >/dev/null 2>&1 || die "adb push $BINARY failed"
+    local local_size board_size attempt=0
+    local_size="$(wc -c < "$REPO_DIR/$BINARY")"
+    while :; do
+        adb push "$(cygpath -m "$REPO_DIR/$BINARY" 2>/dev/null \
+            || printf '%s' "$REPO_DIR/$BINARY")" "$BOARD_DIR/" >/dev/null 2>&1
+        board_size="$(adb shell "wc -c < $BOARD_DIR/$BINARY" 2>/dev/null | tr -d '\r')"
+        [ "$local_size" = "$board_size" ] && break
+
+        attempt=$((attempt + 1))
+        [ "$attempt" -ge 3 ] && die "could not push $BINARY intact: local $local_size, board ${board_size:-nothing}"
+        require_adb || exit 1
+    done
     adb shell "chmod 755 $BOARD_DIR/$BINARY"
-    ok "pushed $BINARY"
+    ok "pushed $BINARY ($board_size bytes verified)"
 
     step "three configurations, ${FRAMES} frames each"
 
