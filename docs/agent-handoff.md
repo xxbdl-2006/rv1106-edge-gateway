@@ -1,7 +1,7 @@
 # 项目对接文档（给下一个 Agent）
 
-> 建立时间：2026-09-29 12:10（GMT+8），最后更新 2026-09-29 12:5x（P0 真实 IMU 源已落地，待上板验证）。
-> 仓库：`github.com/xxbdl-2006/rv1106-edge-gateway`，分支 `main`，HEAD = `4c39f13`，工作区有未提交改动（见 §3 P0）。
+> 建立时间：2026-09-29 12:10（GMT+8），最后更新 2026-09-29 15:2x（P0+P1 全部完成，真实 IMU 已进生产配置）。
+> 仓库：`github.com/xxbdl-2006/rv1106-edge-gateway`，分支 `main`，HEAD = `f724774` 之后（见 `git log`）。
 > 本文件由实测整理而成，**与 `README.md` / `docs/handoff.md` 冲突时以本文件为准**（那两份文档已过时，见 §8）。
 
 ---
@@ -11,18 +11,16 @@
 ```text
 一句话：一块 Luckfox Pico Pro/Max（RV1106G）上的边缘视频网关，
         摄像头 → V4L2 → Rockit MPI H.264 → RTSP over TCP，
-        外加一条「传感器 → OSD 叠加」的支线；视频主线已全部上板验证通过，
-        OSD 支线已通到「能烧进码流」，但喂它的数据目前还是 mock（假）的。
+        外加一条「传感器 → OSD 叠加」的支线；两条都已上板验证并进入生产配置。
+        支线喂的是真实 MPU6500（软件 bit-bang I²C），不是 mock。
 
-当前可对外播放：rtsp://172.32.0.93:8554/live/0  （1280x720 H.264，30fps）
-当前最大缺口  ：**真实 IMU 源已写好（src/mpu6050_source.c + tools/imu_sample.c），但还没在板子上跑过一次。**
-                Windows 侧 9 套单测全绿（新增 test-mpu6050-source 28 项），交叉编译与板端验证待 VM。
+当前可对外播放：rtsp://172.32.0.93:8554/live/0  （1280x720 H.264，30fps，画面上带真实姿态）
+生产配置      ：/userdata/gateway.env 已含 `--osd --osd-source mpu6050`（备份 gateway.env.bak）
+当前状态      ：P0（真实 IMU 源）+ P1（并入生产配置）均已完成并实测；
+                剩 P2 工程化收尾（docs/handoff.md 过时、status.md 缺章节、架构图/演示视频）。
 ```
 
-**下一步只有一件事**：在 VM 编译 → 回 Windows 跑 `bash scripts/verify-imu.sh`。在那之前，
-「真实 IMU 接进来了」这句话只能算代码事实，不算实测事实。
-
-维基式结论：**主线闭环完成且验证充分；支线缺最后一段数据源。**
+维基式结论：**主线与支线都已闭环；剩下的都不是功能，是文档和素材。**
 
 ---
 
@@ -79,15 +77,25 @@
 - **上板实测结果**：`--osd` 跑 300 帧 → `annotated=300 passed_through=0 composite_refused=0`，sensor `polls=300 samples=300`，**30.003 fps vs 无 OSD 30.000 fps（零可测开销）**；像素判定 overlay 区 21.0% 像素变化 >40 灰阶、对照带 0.0%；裁剪图肉眼可见面板。
 - 一键验证脚本存在且已跑通：`scripts/verify-osd.sh`（Windows 入口 `scripts/verify-osd.cmd`）。
 
-⚠️ **当前生产配置没有开 OSD**：板端 `/userdata/gateway.env` 是
-`GATEWAY_ARGS="-d /dev/video11 -w 1280 -H 720 --warmup 30 --sink rtsp --rtsp-port 8554 --threads --ring-slots 4 --quiet"`
-—— 里面**没有 `--osd`**。所以直播流现在是干净画面。这是有意的（OSD 刚验证完，还没决定并入默认配置）。
+✅ **生产配置已开 OSD（2026-09-29 15:2x）**：板端 `/userdata/gateway.env` 现为
+`GATEWAY_ARGS="... --threads --ring-slots 4 --quiet --osd --osd-source mpu6050"`
+—— 真实 IMU 数据烧进直播流。原文件备份在 `/userdata/gateway.env.bak`（120 字节），
+**回滚 = `cp /userdata/gateway.env.bak /userdata/gateway.env` 后 `/etc/init.d/S99gateway restart`**。
+
+**已经在真实流上确认过**（不只是编码计数器）：从 Windows 侧 `ffmpeg -rtsp_transport tcp -i
+rtsp://172.32.0.93:8554/live/0` 抽两帧 PNG，肉眼可见面板，且**两帧之间数值在变**
+（`FRAME 2438→2451`、`TEMP 49.3→49.1`、`ROLL +0.2→+0.5`、`ACC 1.00→0.99`）——
+是活的传感器数据，不是静态渲染。面板内容：`PITCH/ROLL`、`ACC/TEMP`、`STATUS FRAME/FPS`、
+`IMU MPU6050 OK E=0`。
+
+⚠️ 这一条值得坚持：**编码器打印 `annotated=N` 只证明它做了合成，不证明客户端收到了**
+（`--sink rtsp` 没有客户端连接时，RTP 根本不发包）。生产配置上线后必须真拉一次流抽帧看。
 
 ---
 
 ## 3. 未完成（按推荐优先级）
 
-### P0 — 真实 IMU 数据源：**代码已写完，剩上板验证**（2026-09-29）
+### P0 — 真实 IMU 数据源：**✅ 已完成并上板验证**（2026-09-29）
 
 **已完成（Windows 侧全绿，9 套单测）**
 
@@ -201,7 +209,8 @@ Average FPS : 25.000   dropped_busy=0   annotated=300 composite_refused=0
 #### 30 分钟长稳（2026-09-29 14:25~15:05，`bash scripts/imu-soak.sh`）
 
 跑的是 `/userdata/gateway.env` 那条命令行原样加 `--osd --osd-source mpu6050`，**`--sink rtsp`**
-—— 所以这也是第一次带 OSD 的真实推流（下面 P1 里"没跑过"那条已消除）：
+（⚠️ 那次**没有客户端连上来**，所以它证明的是"编码+合成在 RTSP 路径上稳"，不是"客户端收到了"；
+真的拉流验证是 15:2x 补的，见 §2.4）：
 
 ```
 Captured 54000 frames        Average FPS : 30.000
@@ -228,14 +237,23 @@ gpio70/71 无残留
   100 ms 而非 10 ms 的另一条理由（10 ms 会把 CPU 打满，正是当初掉到 21 fps 的原因）。
   要省 CPU 就把间隔调到 200 ms，减半，显示上无差别。
 
-### P1 — 决策：OSD 是否并入默认生产配置
+### P1 — OSD 并入默认生产配置：**✅ 已完成（2026-09-29 15:2x）**
 
-- **`--sink rtsp` 带 OSD 已跑过 30 分钟**（见上），不再是未知项。
-- 唯一前置：`src/v4l2_mpp_encode.c` 的 **fail-soft** 改动（`f724774`）还没编译进板端二进制。
-  没有它，开机时 IMU 不在会直接让网关退出（症状是"开机无流"，而原因是个外设）。
-  有了它，缺 IMU 只是没有叠加层，视频照推。
-- 届时编辑 `/userdata/gateway.env` 加 `--osd --osd-source mpu6050` 即可。
-  **不要**先上 mock：mock 是假数据，真源已经验证过了。
+决策是**直接上真源、并且不经过 mock**（mock 是假数据，真源已经实测过 54000 帧）。
+
+- 板端 `/userdata/gateway.env` 已加 `--osd --osd-source mpu6050`，备份在 `gateway.env.bak`。
+- 走**真实开机路径**（`S99gateway stop` → `start`）验证：日志 `OSD: IMU attached,
+  WHO_AM_I=0x70`、`OSD: on, source=mpu6050 mode=wave`，8554 在听，从 Windows 拉真实流
+  抽帧确认数值在动态更新（见 2.4 末尾）。
+- 前置 fail-soft（`f724774`）已编译进板端二进制；**它在正常路径下不改变任何行为**
+  （回归实测 `FRAMES=300`：`IMU attached / 30.002 fps / annotated=300 / errors=0 / gpio 干净`）。
+- 短版验证用的是 `imu-soak.sh`（`FRAMES=300`），因为它**不依赖 `imu-sample`** ——
+  `make clean` 之后那个采样工具常被漏编，`verify-imu.sh` 会因此直接 die。
+
+**仍未验证的一点（已知、可接受）**：真正的**冷启动**只验证过一半 —— 上面那次
+`rkaiq_3A_server`（pid 1344）是已经跑着的，没有经历"上电 → 3A 首次收敛"那段。
+fail-soft 就是为这个时刻准备的：那一刻 I²C 若没就绪，结果是**没有叠加层而不是没有流**。
+下次自然断电重启时，`grep -E 'IMU attached|IMU unavailable' /userdata/gateway.log` 看一眼即可。
 
 ### P2 — 工程化收尾
 
@@ -371,11 +389,10 @@ adb shell "pidof v4l2_mpp_encode; pidof gateway-supervise.sh; pidof rkaiq_3A_ser
 
 1. 先确认板子还在推流（30 秒）：
    `adb shell "pidof v4l2_mpp_encode && netstat -tln | grep 8554"`
-2. **P0 收尾（推荐，唯一阻塞项）**：二进制是否已带新代码？
-   `adb shell "wc -c < /userdata/v4l2_mpp_encode"` 与本地 `v4l2_mpp_encode` 比字节数，
-   且 `od -An -tx1 -j18 -N2 v4l2_mpp_encode` 必须是 `28 00`。
-   如果 VM 已经编好 → 直接 `bash scripts/verify-imu.sh`（脚本会先自己查这两项）。
-   如果还没编 → 把 §3 P0 里的两条 make 命令交给用户在 VM 跑，然后回来跑脚本。
-3. 验证 PASS 之后再做 P1（OSD 是否并入 `/userdata/gateway.env`）：**先 mock，再真源**，
-   且必须先看 fps 有没有掉。
-4. 无论做哪个：**先跑一遍 `mingw32-make test`** 拿到绿基线（现为 9 套），再动代码。
+   顺手看一眼叠加层是活的还是降级了：
+   `adb shell "grep -E 'IMU attached|IMU unavailable' /userdata/gateway.log | tail -2"`
+2. **P0/P1 已全部完成**（真实 IMU 进生产配置，见 §2.4 与 §3 P1）。剩下的是 P2 工程化收尾。
+3. 改代码前的基线：`mingw32-make test`（现为 11 套全绿），再动代码。
+4. 想复跑一次带 IMU 的验证：`bash scripts/imu-soak.sh`（`FRAMES=300` 快速版，
+   **不依赖 `imu-sample`**）；要跑 `verify-imu.sh` 得先让用户在 VM 补编 `imu-sample`。
+5. 回滚生产配置：`cp /userdata/gateway.env.bak /userdata/gateway.env` + `S99gateway restart`。
