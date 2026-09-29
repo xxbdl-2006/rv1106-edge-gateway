@@ -40,6 +40,33 @@
 
 set -u
 
+# --------------------------------------------------------------------------
+# Tell MSYS not to rewrite the paths we hand to native Windows binaries.
+#
+# Set here rather than expected from the caller, because getting it wrong
+# produces a failure that looks like something else entirely.
+#
+# Measured on this machine, without it:
+#
+#     adb push bin /userdata/x/
+#     → failed to copy 'bin' to
+#       'C:/Users/adms/.workbuddy/binaries/PortableGit/versions/1.2.0/userdata/x/'
+#
+# MSYS rewrote the REMOTE path /userdata/x/ into a local path under its own
+# install directory. The board is then told to write somewhere that does not
+# exist, and the error reads like a permissions or missing-directory problem on
+# the device.
+#
+# Only standalone path arguments are affected -- a path inside a quoted shell
+# string ("ls -l /userdata") is left alone -- which is why this bites on
+# `adb push` and `adb pull` specifically, and why it can go unnoticed until the
+# first transfer.
+#
+# The variable has no meaning outside MSYS, so exporting it unconditionally is
+# harmless on Linux, which is where the build half runs.
+# --------------------------------------------------------------------------
+export MSYS_NO_PATHCONV=1
+
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY="v4l2_mpp_encode"
 BOARD_DIR="/userdata"
@@ -52,9 +79,20 @@ SDK_ROOT="${SDK_ROOT:-/home/aaazhx/luckfox-pico}"
 OSD_ORIGIN_X=8
 OSD_ORIGIN_Y=8
 
-# How long to let the pipeline run before sampling. Long enough to get past
-# --warmup and for the feed to have polled the sensor, short enough to keep the
-# whole script under a minute.
+# How far a pixel has to move to count as "changed", in grey levels, for the
+# strong-pixel statistic in pixel_check.
+#
+# Chosen to sit between the two things that have to be told apart: the overlay
+# moves panel and text pixels by tens of levels, while exposure drift between
+# two clips moves every pixel by a few. 40 is comfortably above the drift seen
+# so far (which put only ~2% of control-band pixels over it) and comfortably
+# below the overlay (which puts ~23% of its region over it).
+#
+# This is a magnitude, not a tuned constant: if the panel or the font changes
+# contrast enough to matter, the numbers are printed on every run so the change
+# is visible rather than silent.
+STRONG_DIFF=40
+
 # How long each clip runs. 300 frames at the requested 30 fps is 10 seconds.
 # Both clips use the same number so a duration difference between them cannot
 # be mistaken for an overlay effect.
@@ -74,7 +112,8 @@ TOOLCHAIN_BIN=""
 BUILD_SIZE=""
 
 # Scratch directory for the pulled clips and the decoded frames. Owned by the
-# verify half; cleared on success and kept on failure so the evidence survives.
+# verify half and kept after the run, success or failure, so the crops can be
+# looked at. Cleared at the start of each run rather than at the end.
 WORK_DIR=""
 
 step() { printf '\n=== %s ===\n' "$*"; }
@@ -377,17 +416,24 @@ stop_gateway() {
 
     if [ -n "$enc" ]; then
         adb shell "kill $enc" 2>/dev/null
+
         # SIGTERM lets the cleanup path print the OSD counters, which is why
         # this is not SIGKILL.
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            adb shell "kill -0 $enc" 2>/dev/null || break
-            sleep 0.5
-        done
-        if adb shell "kill -0 $enc" 2>/dev/null; then
-            adb shell "kill -9 $enc" 2>/dev/null
-            note "encoder needed SIGKILL"
-        else
+        #
+        # Waiting is done with the pidof-based predicate, not with
+        # `adb shell "kill -0 $pid"`. That form looks like the obvious way to
+        # ask "is it still there", and on this board it answers wrong: after
+        # the process is gone it still returns success, so this loop ran all
+        # ten iterations printing "sh: can't kill pid 2882: No such process"
+        # and then concluded the process had needed a SIGKILL -- for a process
+        # that had already exited from the SIGTERM. The log blamed the encoder
+        # for being stubborn when nothing was there at all.
+        if wait_for_exit "$BINARY" 10; then
             ok "encoder $enc stopped cleanly"
+        else
+            adb shell "kill -9 $enc" 2>/dev/null
+            wait_for_exit "$BINARY" 5 || true
+            note "encoder needed SIGKILL"
         fi
     else
         note "no encoder running"
@@ -570,10 +616,17 @@ run_osd() {
     rm -rf "$WORK_DIR"
     mkdir -p "$WORK_DIR"
 
-    # Cleaned on success; kept on failure so the evidence survives. The
-    # trailing `|| true` matters because this runs from an EXIT trap, where a
-    # non-zero status would replace the script's own exit code.
-    trap 'if [ -n "$WORK_DIR" ]; then rm -rf "$WORK_DIR"; fi; restore_gateway' EXIT
+    # Kept on both success and failure, and cleared at the start of the next
+    # run instead (see the rm -rf above).
+    #
+    # It used to delete on success while the closing message still said "clips
+    # kept in ...", which was worse than either choice on its own: the message
+    # pointed at a directory that no longer existed, and the one artifact a
+    # script cannot substitute for -- the picture -- was thrown away exactly
+    # when the run had succeeded and someone might want to look at it.
+    #
+    # Nothing here is large (a few MB) and the directory is gitignored.
+    trap 'restore_gateway' EXIT
 
     step "recording a clip with --osd"
     record_clip "with-osd" "--osd --osd-mode wave"
@@ -744,9 +797,6 @@ verify_output() {
     else
         printf '%d check(s) did not pass.\n' "$failures"
         printf 'Clips kept in %s for inspection.\n' "$WORK_DIR"
-        # Keep the directory on failure; clear WORK_DIR so the EXIT trap does
-        # not delete the evidence.
-        WORK_DIR=""
         exit 1
     fi
 }
@@ -836,122 +886,166 @@ pixel_check() {
     fi
     ok "decoded one frame from each clip (${w}x${h} gray)"
 
-    # Compare two rectangles and report the mean absolute difference.
+    # Compare two rectangles. Reports two numbers: the mean absolute difference,
+    # and the percentage of pixels whose difference exceeds STRONG_DIFF.
     #
-    # Two things here were wrong in the first version, and both produced a
-    # plausible-looking number instead of an error, which is why the function
-    # is now checked against a synthetic frame pair with a known answer before
-    # being trusted on real output:
+    # The second number is the one that decides, and it is a correction made
+    # after measuring real hardware. The mean alone does not separate the two
+    # things it needs to separate:
     #
-    #  1. `od` wraps its output at 16 bytes per line. A reader that assumes one
-    #     line per row of pixels compares the wrong bytes. Flattening with
-    #     `tr -s ' ' '\n'` removes the ambiguity: one byte per line, always.
+    #     overlay present, drifting exposure    MAD 53.2 vs control 19.5 = 2.73x
+    #     overlay absent,  drifting exposure    MAD ~19.5 vs control 19.5 = 1.0x
     #
-    #  2. The two clips are interleaved one ROW at a time, not one byte at a
-    #     time and not one whole-image block at a time. So the reader has to be
-    #     told the row width; pairing byte 2k with byte 2k+1 gives a wrong
-    #     answer (93.5 instead of 52.9 on the test frame), and so does
-    #     splitting the file in half (17.6).
+    # 2.73x is uncomfortably close to the 1.0x it has to be told apart from. But
+    # counting pixels that changed by a LOT gives 11.87x on the same frames,
+    # because the two changes have different shapes:
     #
-    # The error in both wrong versions was in the tens of grey levels, i.e.
-    # well above any threshold that would flag a problem. A pixel check that
-    # reports a confident wrong number is worse than no check, because it is
-    # the evidence you use to decide whether to keep looking.
-    region_mad() {
+    #     the overlay is a sharp local change -- a dark panel and light strokes
+    #     against a scene, so individual pixels move by tens of levels
+    #
+    #     exposure drift is smooth and global -- every pixel moves a little, so
+    #     almost nothing crosses a high threshold
+    #
+    # Choosing a statistic that matches the signature of the thing being
+    # detected is worth more than tuning a threshold on a statistic that does
+    # not. The mean was picking up the drift and nothing else.
+    #
+    # MAD is still reported, because it is what makes the failure message
+    # readable ("the region is nearly identical") when the strong-pixel count is
+    # zero.
+    #
+    # Three bugs preceded this working, all of which produced a plausible number
+    # rather than an error, which is why the function is checked against
+    # synthetic frames with a known answer:
+    #
+    #  1. `od` wraps at 16 bytes per line, so a reader that assumes one line per
+    #     row of pixels compares the wrong bytes.
+    #
+    #  2. The two clips arrive interleaved one ROW at a time, so the reader has
+    #     to be told the row width. Pairing byte 2k with 2k+1 gave 93.5 where
+    #     the truth was 52.9; splitting the file in half gave 17.6.
+    #
+    #  3. `dd bs=1 skip=N` walks N bytes one at a time. In a per-row loop that
+    #     is 160 dd invocations, and each one near the bottom of the frame walks
+    #     half a megabyte byte by byte. It did not fail, it hung: three minutes
+    #     with an empty output file, and nothing but the clock pointed at it.
+    #     Seeking in whole-row blocks (bs=w, skip=y, count=rh) is two dd calls
+    #     total and no byte-by-byte traversal.
+    region_stats() {
         local x="$1" y="$2" rw="$3" rh="$4"
-        local row start
 
-        for (( row = y; row < y + rh; row++ )); do
-            start=$(( row * w + x ))
-            dd if="$a_raw" bs=1 skip="$start" count="$rw" 2>/dev/null
-            dd if="$b_raw" bs=1 skip="$start" count="$rw" 2>/dev/null
-        done | od -An -v -tu1 | tr -s ' ' '\n' | grep -v '^$' > "$WORK_DIR/_pair"
+        {
+            dd if="$a_raw" bs="$w" skip="$y" count="$rh" 2>/dev/null
+            dd if="$b_raw" bs="$w" skip="$y" count="$rh" 2>/dev/null
+        } | od -An -v -tu1 | tr -s ' ' '\n' | grep -v '^$' > "$WORK_DIR/_pair"
 
-        awk -v rw="$rw" '
+        awk -v w="$w" -v x="$x" -v rw="$rw" -v rh="$rh" -v strong="$STRONG_DIFF" '
             { v[++n] = $1 + 0 }
             END {
-                i = 1
-                while (i + 2 * rw - 1 <= n) {
-                    for (k = 0; k < rw; k++) {
-                        d = v[i + k] - v[i + rw + k]
-                        s += (d < 0 ? -d : d)
-                        c++
+                # File A occupies bytes 1..w*rh, file B the same range after it.
+                per = w * rh
+                for (r = 0; r < rh; r++) {
+                    for (c = 0; c < rw; c++) {
+                        a = r * w + x + c + 1
+                        b = per + a
+                        if (b > n) break
+                        d = v[a] - v[b]
+                        if (d < 0) d = -d
+                        s += d
+                        if (d > strong) hit++
+                        k++
                     }
-                    i += 2 * rw
                 }
-                if (c > 0) printf "%.1f", s / c; else printf "0"
+                if (k > 0) printf "%.1f %.1f", s / k, 100 * hit / k
+                else printf "0 0"
             }
         ' "$WORK_DIR/_pair"
     }
 
-    local osd_mad ctl_mad
-    osd_mad="$(region_mad 0 8 "$osd_w" "$osd_h")"
-    ctl_mad="$(region_mad "$ctl_x" "$ctl_y" "$ctl_w" "$ctl_h")"
+    local osd_stats ctl_stats osd_mad osd_strong ctl_mad ctl_strong
+    osd_stats="$(region_stats 0 8 "$osd_w" "$osd_h")"
+    ctl_stats="$(region_stats "$ctl_x" "$ctl_y" "$ctl_w" "$ctl_h")"
+    osd_mad="${osd_stats%% *}";  osd_strong="${osd_stats##* }"
+    ctl_mad="${ctl_stats%% *}";  ctl_strong="${ctl_stats##* }"
 
-    printf '  mean abs difference: overlay region %s, control band %s\n' \
-           "$osd_mad" "$ctl_mad"
+    printf '  overlay region : MAD %s, %s%% of pixels changed by more than %s\n' \
+           "$osd_mad" "$osd_strong" "$STRONG_DIFF"
+    printf '  control band   : MAD %s, %s%% of pixels changed by more than %s\n' \
+           "$ctl_mad" "$ctl_strong" "$STRONG_DIFF"
 
-    # The judgement is RELATIVE, and that is a correction made after the first
-    # run on real hardware rather than something designed up front.
+    # The judgement, and the reasoning behind both thresholds.
     #
-    # The first version asserted an absolute ceiling on the control band (4).
-    # On the synthetic test frames that were used to validate the arithmetic
-    # this looked fine, because both synthetic scenes were byte-identical
-    # outside the overlay and the control band measured 0.0 exactly.
+    # An earlier version capped the control band's mean difference at an
+    # absolute value. That held on the synthetic frames used to validate the
+    # arithmetic -- their backgrounds were byte-identical, so the control band
+    # measured exactly 0.0 -- and it was wrong on real hardware, where a live
+    # camera with drifting exposure gives a control band of 5.8 to 19.5
+    # depending on conditions. It would have rejected correct results and
+    # blamed the scene.
     #
-    # Real video is not like that. Measured here: overlay region 44.9, control
-    # band 5.8, whole frame 3.9. The camera is live, the sensor has no 3A
-    # running so exposure drifts between runs, and the encoder makes different
-    # decisions once the overlay changes the content. A ceiling of 4 would have
-    # rejected a perfectly good result and pointed at "the scenes differ" --
-    # sending the next hour after a problem that did not exist.
+    # What separates the cases is the SHAPE of the change, not its size, so the
+    # decision is made on the strong-pixel percentage:
     #
-    # The signal-to-noise ratio is what actually carries the information: the
-    # overlay is ~7.7x the background variation. So:
+    #                       MAD      strong%
+    #   overlay present    53.2        23.3%
+    #   control band       19.5         2.0%
     #
-    #   absolute floor   the region must differ at all, by more than codec noise
-    #   relative floor   it must stand out from what the rest of the frame did
-    #
-    # The first alone was the original design; the second alone would pass on a
-    # perfectly static scene even if the overlay were faint. Together they hold
-    # up on both the synthetic case and this one.
+    # 11.9x on the strong-pixel count against 2.7x on the mean. The overlay is
+    # sharp and local; drift is smooth and global. Both thresholds below are set
+    # well inside that gap.
     local failures=0
-    local min_osd=6
-    local min_ratio=3
+    local min_strong=3      # absolute: some pixels must have moved a lot
+    local min_ratio=5       # relative: far more than the control band did
 
-    if awk "BEGIN{exit !($osd_mad >= $min_osd)}"; then
-        ok "the overlay region differs (MAD $osd_mad >= $min_osd)"
+    if awk "BEGIN{exit !($osd_strong >= $min_strong)}"; then
+        ok "the overlay region changed sharply (${osd_strong}% > ${min_strong}%)"
     else
-        printf '  MISS the overlay region is nearly identical (MAD %s < %s).\n' \
-               "$osd_mad" "$min_osd"
-        printf '       The overlay is not in the encoded picture. The counters\n'
-        printf '       said it was composited, so look at whether the annotator\n'
-        printf '       handed the encoder the scratch pointer or the original.\n'
+        printf '  MISS almost nothing in the overlay region changed by more\n'
+        printf '       than %s grey levels (%s%% of pixels).\n' \
+               "$STRONG_DIFF" "$osd_strong"
+        if awk "BEGIN{exit !($osd_mad >= 6)}"; then
+            printf '       Note the mean difference IS non-zero (%s), so the clips\n' "$osd_mad"
+            printf '       differ -- but smoothly, the way exposure drift looks,\n'
+            printf '       not the way a dark panel with light text looks.\n'
+        else
+            printf '       The overlay is not in the encoded picture. The counters\n'
+            printf '       said it was composited, so check whether the annotator\n'
+            printf '       handed the encoder the scratch pointer or the original.\n'
+        fi
         failures=$((failures + 1))
     fi
 
-    # `ctl_mad > 0` guards the division. A control band of exactly zero means a
-    # perfectly static scene, which is the synthetic case, and there the ratio
-    # test carries no information -- the absolute floor above already decides.
-    if awk "BEGIN{exit !($ctl_mad <= 0 || $osd_mad >= $min_ratio * $ctl_mad)}"; then
-        ok "it stands out from the background (MAD $osd_mad vs $ctl_mad, ratio >= $min_ratio)"
+    # A control band of exactly zero means a perfectly static scene (the
+    # synthetic case), where the ratio carries no information and the absolute
+    # floor above already decides.
+    if awk "BEGIN{exit !($ctl_strong <= 0 || $osd_strong >= $min_ratio * $ctl_strong)}"; then
+        ok "it stands out from the background (${osd_strong}% vs ${ctl_strong}%, ratio >= $min_ratio)"
     else
-        printf '  MISS the overlay region barely differs from the background\n'
-        printf '       (MAD %s vs %s). Either the overlay is very faint, or the\n' \
-               "$osd_mad" "$ctl_mad"
-        printf '       two clips show different scenes. Check the PNGs kept in\n'
-        printf '       the work directory before trusting anything else.\n'
+        printf '  MISS the overlay region changed about as much as the background\n'
+        printf "       (%s%% vs %s%%). Either the overlay is faint, or the two\n" \
+               "$osd_strong" "$ctl_strong"
+        printf '       clips show different scenes. Look at the crops kept in\n'
+        printf '       %s before trusting anything else.\n' "$WORK_DIR"
         failures=$((failures + 1))
     fi
 
     # Keep a human-viewable crop of each frame. The numbers above say whether
     # the region changed; only the picture says whether what changed is the
     # overlay. A garbled or misplaced panel would pass every threshold here.
+    #
+    # The output path goes through to_native_path like every other path handed
+    # to ffmpeg. Missing that on the OUTPUT is a quieter failure than on the
+    # input: ffmpeg exits non-zero, the `&&` swallows the note, and the run
+    # still reports PASS at the end -- with no picture to look at and nothing
+    # said about why.
     for label in with-osd no-osd; do
-        ffmpeg -v error -i "$(to_native_path "$WORK_DIR/osd-$label.h264")" \
-            -vf "select=gte(n\,$frame_index),crop=400:120:0:0,scale=800:240:flags=neighbor" \
-            -frames:v 1 -y "$WORK_DIR/crop-$label.png" 2>/dev/null \
-            && note "crop-$label.png written (top-left 400x120, 2x)"
+        if ffmpeg -v error -i "$(to_native_path "$WORK_DIR/osd-$label.h264")" \
+             -vf "select=gte(n\,$frame_index),crop=400:120:0:0,scale=800:240:flags=neighbor" \
+             -frames:v 1 -y "$(to_native_path "$WORK_DIR/crop-$label.png")" 2>/dev/null; then
+            note "crop-$label.png written (top-left 400x120, 2x)"
+        else
+            note "could not write crop-$label.png"
+        fi
     done
 
     [ "$failures" -eq 0 ]
@@ -1033,6 +1127,16 @@ Usage: $(basename "$0") [--build-only | --verify-only | --help]
                   board is plugged into. Requires a binary already built.
   (no argument)   both halves in order. For a host that has the SDK and the
                   board.
+
+This is a bash script, so it has to be run BY bash. From PowerShell or cmd:
+
+    bash scripts/verify-osd.sh --verify-only
+
+Running \`./scripts/verify-osd.sh\` from PowerShell works only if .sh files are
+associated with a shell, and \`MSYS_NO_PATHCONV=1 ./scripts/...\` does not work
+at all -- \`VAR=value command\` is POSIX syntax that PowerShell rejects with
+"not recognized as the name of a cmdlet". The variable is set inside the script
+now, so nothing has to be exported by hand.
 
 Environment:
   CROSS_COMPILE   toolchain prefix (default ${TOOLCHAIN_PREFIX})

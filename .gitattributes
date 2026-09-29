@@ -15,3 +15,8 @@ scripts/gateway-supervise.sh text eol=lf
 scripts/soak-monitor.sh text eol=lf
 
 *.ps1 text eol=crlf
+
+# cmd.exe batch files. CRLF is not optional here in the way it is for .sh: the
+# parser reads line by line and an LF-only file can misbehave around labels and
+# multi-line blocks. Keep it explicit so an editor on Linux cannot break it.
+*.cmd text eol=crlf
