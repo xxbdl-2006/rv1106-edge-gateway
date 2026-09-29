@@ -145,6 +145,7 @@ MPU6050(bit-bang I²C) / Mock Sensor -> Sensor RingBuffer -> Sensor Attitude
 │   ├── verify-imu.sh         真实 IMU 一键验证
 │   ├── verify-mpu6050.sh     MPU6050 驱动验证
 │   ├── imu-soak.sh           带真实 IMU 的长稳（不依赖 imu-sample）
+│   ├── netdrop.sh            板端：把 RNDIS 网口捅掉 N 秒再拉起（网络中断/恢复验证）
 │   ├── start-2h-soak.sh      长稳（2h/8h）
 │   ├── fps-osd-compare.sh    同场次帧率对照/扫描
 │   ├── soak-monitor.sh       资源采样到 /userdata/soak.csv
@@ -541,7 +542,7 @@ VLC / ffplay 可以打开 rtsp://172.32.0.93:8554/live/0
 [x] 真实 MPU6050 接入（src/mpu6050_source.c）
 [x] OSD + 真实 IMU 并入默认生产配置（gateway.env，30 分钟长稳）
 [x] 冷启动（上电 → 3A 首次收敛）完整验证 —— 已做（含物理断电重启），并发现+修复严重缺陷
-[ ] 网络断开/恢复专项测试
+[x] 网络断开/恢复专项测试 —— 已做：网口捅掉 20s，网关不崩不泄漏、可重连
 [ ] 端到端延迟的正式测量（目前只有 ffplay ~0.75s 粗测）
 [ ] 架构图与演示视频
 
