@@ -1,6 +1,7 @@
 # 项目对接文档（给下一个 Agent）
 
-> 建立时间：2026-09-29 12:10（GMT+8），最后更新 2026-09-29 15:2x（P0+P1 全部完成，真实 IMU 已进生产配置）。
+> 建立时间：2026-09-29 12:10（GMT+8），最后更新 2026-09-29 16:xx
+> （P0+P1 完成 → 随后完成 P2 的文档纠偏：README / handoff / status / roadmap 四份已对齐现状）。
 > 仓库：`github.com/xxbdl-2006/rv1106-edge-gateway`，分支 `main`，HEAD = `f724774` 之后（见 `git log`）。
 > 本文件由实测整理而成，**与 `README.md` / `docs/handoff.md` 冲突时以本文件为准**（那两份文档已过时，见 §8）。
 
@@ -17,7 +18,8 @@
 当前可对外播放：rtsp://172.32.0.93:8554/live/0  （1280x720 H.264，30fps，画面上带真实姿态）
 生产配置      ：/userdata/gateway.env 已含 `--osd --osd-source mpu6050`（备份 gateway.env.bak）
 当前状态      ：P0（真实 IMU 源）+ P1（并入生产配置）均已完成并实测；
-                剩 P2 工程化收尾（docs/handoff.md 过时、status.md 缺章节、架构图/演示视频）。
+                P2 文档纠偏已完成（README / handoff / status / roadmap）；
+                仍缺：网络断线恢复测试、端到端延迟正式测量、架构图、演示视频、冷启动完整验证。
 ```
 
 维基式结论：**主线与支线都已闭环；剩下的都不是功能，是文档和素材。**
@@ -64,7 +66,7 @@
   **Python 找得到而 C 版找不到 = 移植错了，不是硬件问题。**
 
 **数据面接缝已接上（2026-09-29）**：新增 `src/mpu6050_source.{h,c}`（实现 `sensor_source` 接口）
-与 `tools/imu_sample.c`（板端取数工具）。`--osd-source mpu6050` 已可选。**尚未上板验证**，见 §3。
+与 `tools/imu_sample.c`（板端取数工具）。`--osd-source mpu6050` 已可选。**已上板验证并进生产配置**，见 §3 P0 与 §2.4。
 
 ### 2.3 Sensor 数据面 —— 已完成
 
@@ -266,11 +268,13 @@ fail-soft 就是为这个时刻准备的：那一刻 I²C 若没就绪，结果�
 
 | 项 | 状态 |
 | --- | --- |
-| `README.md` / `docs/handoff.md` 内容过时 | 仍写着「尚未实现 OSD 和 MPU6050」「待 8 小时验收」，实际都已完成——本次已修 README 的"当前状态/后续路线"两处，handoff §3/§13/§14 仍旧 |
-| 网络断开/恢复的专项测试 | roadmap 列了，**没跑过** |
-| 架构图、演示视频 | roadmap「最终交付物」列出，**未产出** |
-| 延迟的正式测量 | 只有 ffplay 约 0.75s 的粗测，无文档化方法 |
-| `docs/status.md` 更新到 2026-09-29 | 最新文件写到 2026-09-28，缺 OSD 上板章节 |
+| `README.md` / `docs/handoff.md` 内容过时 | ✅ **已修（2026-09-29）**：README 全文（当前状态/传感器行/OSD 参数/仓库结构/测试套件/后续路线勾选）；`docs/handoff.md` §2/§3/§5/§7/§11/§13/§14/§15/§16/§19 并加文首状态横幅 |
+| `docs/roadmap.md` 未按完成度更新勾选 | ✅ **已修**：文首加完成度核对表，各阶段标题加 ✅/⚠️，传感器与 OSD 两处写上与原计划的偏差 |
+| `docs/status.md` 更新到 2026-09-29 | ✅ **已修**：新增 §1.3（OSD 上板）、§1.4（真实 IMU 进生产配置）、§2.6（bit-bang 28 ms 根因）、§2.7（配置多处=副本）；补全 §3 架构与 §4 套件表、§5 板端操作 |
+| 网络断开/恢复的专项测试 | roadmap 列了，**没跑过**（仍待做） |
+| 架构图、演示视频 | roadmap「最终交付物」列出，**未产出**（仍待做） |
+| 延迟的正式测量 | 只有 ffplay 约 0.75s 的粗测，无文档化方法（仍待做） |
+| 冷启动（上电 → 3A 首次收敛）完整验证 | fail-soft 已就位，只差自然断电重启实测（仍待做） |
 | 仓库根目录有一批散落的测试 `.exe` 与 `op.log`、`.prev` | 已被 .gitignore 覆盖，git 状态干净 |
 
 ---
@@ -404,12 +408,12 @@ ffmpeg -rtsp_transport tcp -i rtsp://172.32.0.93:8554/live/0 -t 8 -frames:v 2 ou
 | 文件 | 状态 | 说明 |
 | --- | --- | --- |
 | **本文件** | ✅ 最新（2026-09-29） | 交接首选 |
-| `docs/status.md` | ⚠️ 到 2026-09-28 | 验收数据、根因分析最全，**但缺 OSD 上板章节** |
-| `docs/roadmap.md` | ✅ 有效 | 阶段规划，尚未按完成度更新勾选 |
+| `docs/status.md` | ✅ **到 2026-09-29** | 验收数据、根因分析最全；已补 OSD 上板（§1.3）、真实 IMU（§1.4）、bit-bang 28 ms 根因（§2.6）、配置多处即副本（§2.7） |
+| `docs/roadmap.md` | ✅ 已按完成度更新 | 文首完成度核对表 + 各阶段 ✅/⚠️ 标记 |
 | `.workbuddy/memory/MEMORY.md` | ✅ 最新（2026-09-29 重写） | 长期项目知识，16KB |
 | `.workbuddy/memory/2026-09-29.md` | ✅ | OSD 验证的完整流水 |
-| `README.md` | ⚠️ | 「当前状态」原写着「尚未实现 OSD 和 MPU6050」；「后续路线」勾选框仍标 `[ ] 8 小时长稳正式验收`。本次已修正这两处措辞，其余节仍写于 OSD 之前 |
-| `docs/handoff.md` | ❌ 明显过时 | §3 表把 MPU6050 标「未完成·硬件尚未接入」、长稳标「进行中」；§13「当前限制」仍写着「没有 RTSP / 没有 Frame RingBuffer / 没有开机服务」（全部早已实现）。**写于 RTSP 阶段，别拿它判断现状** |
+| `README.md` | ✅ **本轮已全量修正** | 当前状态、传感器行、OSD 参数表、仓库结构树、测试套件（十套 1205 项）、后续路线勾选全部对齐现状 |
+| `docs/handoff.md` | ⚠️ 历史快照（**已加文首横幅并修正主要章节**） | 仍写于 RTSP 阶段，但 §2/§3/§5/§7/§11/§13/§14/§15/§16/§19 已重写为现状；**判断现状仍以本文件为准**，该文件的其余章节作为设计意图的历史记录保留 |
 | `docs/mpu6050-wiring.md` | ✅ 可用 | 接线、overlay 证伪 §3.5、bit-bang §4、上板步骤 §6 |
 
 > 规则：`docs/status.md` 描述**实测到了什么**，`docs/handoff.md` 描述**当年交接时的架构**。两者冲突以 status.md 为准；**两者都过时时以本文件为准。**
@@ -422,8 +426,12 @@ ffmpeg -rtsp_transport tcp -i rtsp://172.32.0.93:8554/live/0 -t 8 -frames:v 2 ou
    `adb shell "pidof v4l2_mpp_encode && netstat -tln | grep 8554"`
    顺手看一眼叠加层是活的还是降级了：
    `adb shell "grep -E 'IMU attached|IMU unavailable' /userdata/gateway.log | tail -2"`
-2. **P0/P1 已全部完成**（真实 IMU 进生产配置，见 §2.4 与 §3 P1）。剩下的是 P2 工程化收尾。
-3. 改代码前的基线：`mingw32-make test`（现为 11 套全绿），再动代码。
+2. **P0/P1 已全部完成**（真实 IMU 进生产配置，见 §2.4 与 §3 P1）。
+   **P2 的文档纠偏也已完成**（README / handoff / status / roadmap 四份已对齐现状，见 §3 P2 表）。
+   剩余 P2：网络断线恢复测试、端到端延迟正式测量、架构图、演示视频、冷启动完整验证 —— **都是功能之外的活**。
+3. 改代码前的基线：`mingw32-make test`（现为 **10 个测试二进制套件全绿**，
+   合计约 1205 项 0 失败；外加 `board-flags` 与 `host-syntax-can-fail` 两项标志检查。
+   `test-sensor` 的项数每次运行浮动，属正常），再动代码。
 4. 想复跑一次带 IMU 的验证：`bash scripts/imu-soak.sh`（`FRAMES=300` 快速版，
    **不依赖 `imu-sample`**）；要跑 `verify-imu.sh` 得先让用户在 VM 补编 `imu-sample`。
 5. 回滚生产配置：`cp /userdata/gateway.env.bak /userdata/gateway.env` + `S99gateway restart`。

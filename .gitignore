@@ -45,3 +45,7 @@ datasheets/
 # Same, for the two newer board scripts.
 /.imu-verify/
 /.fps-compare/
+
+# Frame grabs from the "is the overlay actually live" spot check: two PNGs
+# pulled straight off the RTSP stream. Evidence for one session, not an asset.
+/.healthcheck/

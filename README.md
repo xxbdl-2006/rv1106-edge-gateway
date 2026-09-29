@@ -8,7 +8,7 @@
 SC3336 -> MIPI CSI -> V4L2 -> NV12 -> MPP H.264 -> Packet Queue -> RTSP
 ```
 
-后续继续接入 MPU6050、OSD 和告警。
+**MPU6050、OSD 均已接入并进生产配置**（见下），剩余工作见 `docs/agent-handoff.md`。
 
 ## 当前状态
 
@@ -24,9 +24,12 @@ SC3336 -> MIPI CSI -> V4L2 -> NV12 -> MPP H.264 -> Packet Queue -> RTSP
 - **开机自启**：重启后约 11 秒自动出流，无需人工操作。
 - **Frame RingBuffer + 采集线程独立**（`--threads`），已上板验证并跑满 8 小时。
 - **Sensor 数据面**：`sensor_source` 接口 + 有界环形缓冲 + 姿态解算 + Mock 数据源。
-- **MPU6050 驱动**：位翻转 I2C 已上真硅片读通（`WHO_AM_I=0x70`，0 io error），**但未接入数据面**。
-- **OSD 叠加**：已接进编码流水线并上板验证 PASS（300/300 帧合成成功，帧率零开销）。
-  注意：当前 `/userdata/gateway.env` **没有** `--osd`，直播流默认是干净画面。
+- **MPU6050 驱动**：位翻转 I2C 已上真硅片读通（`WHO_AM_I=0x70`，0 io error）；
+  overlay 在这块板上是坏的，因此**不走 `/dev/i2c-4`**，改用 GPIO pin 14/24 位翻转。
+- **真实 IMU 源**：`mpu6050_source` 实现 `sensor_source`，`--osd-source mpu6050` 可选。
+- **OSD 叠加**：已接进编码流水线并上板验证 PASS（300/300 帧合成成功，**帧率零开销**）。
+- **生产配置已开 OSD + 真实 IMU**：`/userdata/gateway.env` 含 `--osd --osd-source mpu6050`，
+  30 分钟 54000 帧 30.000 fps 长稳通过，真拉流抽帧确认数值在动态更新。
 
 > 全局最新的完成/未完成清单见 **`docs/agent-handoff.md`**；本文件的这部分不再维护。
 
@@ -43,7 +46,10 @@ rtsp://172.32.0.93:8554/live/0
 ```
 
 采集与编码默认仍是同步流水线；加 `--threads` 后采集线程独立、经 Frame RingBuffer 交给编码。
-加 `--osd` 后传感器遥测会被合成进每一帧；当前只支持 `--osd-source mock`，真实 MPU6050 尚未接入。
+加 `--osd` 后传感器遥测会被合成进每一帧；`--osd-source` 支持 `mock`（假数据）与
+`mpu6050`（**生产配置用的真实源**）。轮询间隔由 `--osd-imu-interval-ms` 控制，默认 100 ms
+（这个值不是随便取的：一次 bit-bang 突发 ≈28 ms，按 10 ms 读会把帧率从 30 打到 21.4，
+详见 `docs/status.md` §2.6）。
 
 详细的验收数据、已修复缺陷根因和构建自测说明见 `docs/status.md`。
 
@@ -54,7 +60,7 @@ rtsp://172.32.0.93:8554/live/0
 | 主控 | Rockchip RV1106G，Cortex-A7 + RISC-V + 0.5T NPU |
 | 开发板 | Luckfox Pico Pro / Max |
 | 摄像头 | SC3336，MIPI CSI，2304x1296 |
-| 传感器 | MPU6050，规划接入 `/dev/i2c-4`（尚未接入） |
+| 传感器 | MPU6050（料为 MPU6500，`WHO_AM_I=0x70`），**已接入**，走 GPIO pin 14/24 位翻转 I²C |
 | 板端系统 | Buildroot Linux 5.10.160，`armv7l` |
 | 启动介质 | TF/SD 卡，`/dev/mmcblk1` |
 | 宿主机 | Windows 11 + VMware Ubuntu 22.04 |
@@ -95,7 +101,7 @@ client    每连接一个线程，只做请求/应答，绝不碰队列
 
 RTP 的 seq/timestamp 是**流的属性而不是连接的属性**，所以必须"一次打包、多方扇出"。
 
-目标架构：
+完整架构（**两条都已实现并上板**）：
 
 ```text
 [v4l2_capture] --NV12--> Frame RingBuffer --NV12--> [encoder thread]
@@ -106,10 +112,14 @@ RTP 的 seq/timestamp 是**流的属性而不是连接的属性**，所以必须
                                                           v
                                                     [rtsp / sink]
 
-MPU6050 / Mock Sensor -> Sensor RingBuffer -> OSD / Alarm
+MPU6050(bit-bang I²C) / Mock Sensor -> Sensor RingBuffer -> Sensor Attitude
+                                    -> OSD (1bpp canvas) -> 合成进编码器输入的私有副本
 ```
 
-`--threads` 已经实现左侧的采集线程 + Frame RingBuffer 部分。
+`--threads` 实现左侧的采集线程 + Frame RingBuffer 部分；`--osd --osd-source mpu6050`
+实现下方支线。两条线的接缝只有一处：`SENSOR_SRC` **不进** `MEDIA_SRC`。
+
+> **告警（Alarm）未实现**：当前只有 TILT / MAG 两个阈值标记烧进叠加层，没有独立告警通道。
 
 ## 仓库结构
 
@@ -118,48 +128,81 @@ MPU6050 / Mock Sensor -> Sensor RingBuffer -> OSD / Alarm
 ├── Makefile
 ├── README.md
 ├── docs/
-│   ├── adb-flash.md
-│   ├── handoff.md
-│   ├── roadmap.md
-│   └── status.md
+│   ├── agent-handoff.md      ★ 最新交接文档（现状以此为准）
+│   ├── status.md             实测数据与根因分析
+│   ├── handoff.md            历史快照（写于 RTSP 阶段，已标注）
+│   ├── roadmap.md            阶段规划
+│   ├── mpu6050-wiring.md     接线、overlay 证伪、bit-bang、上板步骤
+│   ├── luckfox-pico-max-pinout.md
+│   ├── next-tests.md
+│   └── adb-flash.md
 ├── scripts/
-│   ├── S99gateway
+│   ├── gateway.env           ★ 生产命令行的唯一来源
+│   ├── S99gateway            开机自启（接管 rkipc、启 3A、拉 supervisor）
+│   ├── gateway-supervise.sh  看护进程
+│   ├── install_autostart.ps1 安装三件套到 /userdata
+│   ├── verify-osd.sh / .cmd  OSD 上板一键验证
+│   ├── verify-imu.sh         真实 IMU 一键验证
+│   ├── verify-mpu6050.sh     MPU6050 驱动验证
+│   ├── imu-soak.sh           带真实 IMU 的长稳（不依赖 imu-sample）
+│   ├── start-2h-soak.sh      长稳（2h/8h）
+│   ├── fps-osd-compare.sh    同场次帧率对照/扫描
+│   ├── soak-monitor.sh       资源采样到 /userdata/soak.csv
+│   ├── gen_osd_font.py       点阵字体生成
+│   ├── adb-helper.sh         adb_sh 封装（避免并行杀 daemon）
 │   ├── diagnose_v4l2.sh
-│   ├── flash_image.ps1
-│   ├── flash_partition.sh
-│   ├── gateway-supervise.sh
-│   ├── install_autostart.ps1
-│   ├── soak-monitor.sh
-│   ├── start_gateway.ps1
-│   └── start_rkaiq.sh
+│   ├── start_gateway.ps1 / start_rkaiq.sh
+│   ├── flash_image.ps1 / flash_partition.sh
+│   └── probe-i2c3-*.sh       早期 I²C 引脚探测（历史）
 ├── src/
-│   ├── capture_signal.h      共享的 g_stop 声明
-│   ├── capture_thread.c/.h   采集线程 + Frame RingBuffer 生产者
-│   ├── frame_ring.c/.h       有界帧环形缓冲（覆盖最旧帧）
-│   ├── h264_util.c/.h        Annex-B / NAL 工具
+│   ├── v4l2_capture.c        V4L2 采集（同步基线 + 诊断工具）
+│   ├── v4l2_mpp_encode.c     主程序
 │   ├── mpp_encoder.c/.h      Rockit VENC 编码封装
+│   ├── capture_thread.c/.h   采集线程 + Frame RingBuffer 生产者
+│   ├── capture_signal.h      共享的 g_stop 声明
+│   ├── frame_ring.c/.h       有界帧环形缓冲（覆盖最旧帧）
 │   ├── packet_queue.c/.h     有界 packet 队列（丢最旧整个 GOP）
 │   ├── packet_sink.h         Sink 抽象接口
-│   ├── rtp_h264.c/.h         H.264 RTP 打包（纯缓冲，可主机自测）
-│   ├── rtsp_proto.c/.h       RTSP 解析 / SDP（纯缓冲，可主机自测）
-│   ├── rtsp_server.c/.h      RTSP 服务端（唯一持有 socket 的文件）
 │   ├── sink_file.c/.h        文件 Sink
 │   ├── sink_queue.c/.h       队列 Sink
-│   ├── v4l2_capture.c        V4L2 采集（同步基线 + 诊断工具）
-│   └── v4l2_mpp_encode.c     主程序
+│   ├── rtsp_server.c/.h      RTSP 服务端（唯一持有 socket 的文件）
+│   ├── rtsp_proto.c/.h       RTSP 解析 / SDP（纯缓冲，可主机自测）
+│   ├── rtp_h264.c/.h         H.264 RTP 打包（纯缓冲，可主机自测）
+│   ├── h264_util.c/.h        Annex-B / NAL 工具
+│   ├── sensor_source.h       Sensor 抽象接口
+│   ├── mock_sensor.c/.h      Mock 数据源
+│   ├── mpu6050_source.c/.h   真实 IMU 源（convert 纯算术，host 可测）
+│   ├── mpu6050.c/.h          寄存器编解码、标定、量程换算
+│   ├── mpu6050_i2c.c         bit-bang I²C 驱动层
+│   ├── mpu6050_gpio.h        引脚配置
+│   ├── i2c_bitbang.c/.h      bit-bang 时序
+│   ├── gpio_sysfs.c/.h       sysfs GPIO 封装
+│   ├── sensor_ring.c/.h      有界样本环
+│   ├── sensor_attitude.c/.h  pitch/roll 解算
+│   ├── sensor_math.h         无 libm 的三角/开方
+│   ├── osd_font.c/.h         5x7 点阵字体（生成物）
+│   ├── osd_overlay.c/.h      1bpp 画布 + NV12 合成
+│   ├── osd_format.c/.h       定点格式化
+│   ├── osd_telemetry.c/.h    遥测行
+│   ├── osd_feed.c/.h         50Hz 采样
+│   └── osd_annotate.c/.h     私有副本里合成
 ├── tests/
 │   ├── host-stubs/           MinGW 缺 POSIX 头文件时的语法检查桩
-│   ├── test_capture_thread.c
-│   ├── test_frame_ring.c
-│   ├── test_packet_queue.c
-│   └── test_rtp_rtsp.c
+│   ├── test_packet_queue.c   test_rtp_rtsp.c
+│   ├── test_frame_ring.c     test_capture_thread.c
+│   ├── test_mpu6050.c        test_i2c_bitbang.c
+│   ├── test_mpu6050_source.c test_sensor.c
+│   └── test_osd.c            test_osd_pipeline.c
 └── tools/
+    ├── imu_sample.c          板端取数（走 sensor_source 接口）
+    ├── mpu6050-probe.c       板端驱动探测
+    ├── i2c-bitbang.py        ★ 黄金对照（Python 版，同板同芯片同引脚）
     └── nv12_to_png.py
 ```
 
 分层原则：**socket 只出现在 `src/rtsp_server.c` 一个文件里**。协议解析、RTP 打包、
-Frame RingBuffer、Packet Queue 都是纯缓冲、无系统依赖，因此全部可以在主机上跑单测。
-新增网络功能请沿用这个划分。
+Frame RingBuffer、Packet Queue、传感器数学、OSD 各层都是纯缓冲、无系统依赖，
+因此全部可以在主机上跑单测。新增网络功能请沿用这个划分。
 
 ## SDK 路径
 
@@ -223,16 +266,27 @@ v4l2_mpp_encode
 make test
 ```
 
-会构建并依次运行四套测试：
+会构建并依次运行**十个测试套件**（外加 `board-flags` 与 `host-syntax-can-fail` 两项标志检查）：
 
 ```text
-test-packet-queue     43 checks
-test-rtp-rtsp         86 checks
-test-frame-ring       64 checks
-test-capture-thread   13 checks
------------------------------
-                     206 checks, 0 failures
+test-packet-queue      43 checks
+test-rtp-rtsp          86 checks
+test-frame-ring        64 checks
+test-capture-thread    13 checks
+test-mpu6050          105 checks
+test-i2c-bitbang       50 checks
+test-mpu6050-source    28 checks
+test-sensor           622~697 checks（每次运行浮动，见下）
+test-osd              143 checks
+test-osd-pipeline      39 checks
+--------------------------------------
+                     1205 checks, 0 failures（本轮实测）
 ```
+
+> `test-sensor` 的检查项数量**每次运行都不固定**，全部 PASS。原因是有个真线程的
+> 生产者/消费者用例，每消费一个样本计一次 CHECK，消费多少取决于调度。
+> **这不是失败，别去「修」它；也别把某个固定数字写进文档。**
+> 统计检查项数也不要 `grep "checks="`（长行会截断），宜单独跑二进制。
 
 只做语法检查（不链接，用于含 socket / V4L2 的文件）：
 
@@ -312,6 +366,27 @@ adb shell "/userdata/v4l2_mpp_encode -d /dev/video11 --sink rtsp --threads --rin
 | `--ring-slots N` | 4 | Frame Ring 槽位数（2~64） |
 | `--rtsp-port N` | 8554 | RTSP 监听端口 |
 | `--sink mode` | `file` | `file` / `queue` / `rtsp` |
+| `--osd` | 关 | 把传感器遥测合成进每一帧 |
+| `--osd-source src` | `mock` | `mock`（假数据）/ `mpu6050`（**生产用的真实源**） |
+| `--osd-imu-interval-ms N` | 100 | IMU 总线读取间隔（0~10000，0=用源默认）。**日常不用写** |
+
+### OSD 叠加
+
+```powershell
+# 真实 IMU 叠加（生产配置用的就是这条）
+adb shell "/userdata/v4l2_mpp_encode -d /dev/video11 -w 1280 -H 720 --warmup 30 \
+  --sink rtsp --rtsp-port 8554 --threads --ring-slots 4 --osd --osd-source mpu6050"
+```
+
+面板内容：`PITCH/ROLL`、`ACC/TEMP`、`STATUS FRAME/FPS`、`IMU MPU6050 OK E=0`。
+
+> 🔴 `--osd-imu-interval-ms` 默认 **100 ms 不是随便取的**：一次 bit-bang I²C 突发
+> 实测 ≈ **28 ms**，按 10 ms 读会把帧率从 30 打到 21.4。三档对照见 `docs/status.md` §2.6。
+>
+> ⚠️ 编码器打印 `annotated=N` **只证明它做了合成，不证明客户端收到了**
+> （`--sink rtsp` 没客户端时 RTP 根本不发包）。**上生产配置后必须真拉一次流抽帧看**：
+> `ffmpeg -rtsp_transport tcp -i rtsp://172.32.0.93:8554/live/0 -t 8 -frames:v 2 out-%02d.png`
+> 且**两帧数值要在变**，否则分不清活数据和静态渲染。
 
 ### 开机自启
 
@@ -321,12 +396,23 @@ adb shell "/userdata/v4l2_mpp_encode -d /dev/video11 --sink rtsp --threads --rin
 powershell -ExecutionPolicy Bypass -File .\scripts\install_autostart.ps1 -Start
 ```
 
+> 🔴 **生产命令行的唯一来源是仓库里的 `scripts/gateway.env`**，由安装脚本推成板上的
+> `/userdata/gateway.env`。**改配置改仓库那份再重装，不要在板上直接改** ——
+> 板上那份是副本，下一次重装会静默覆盖它，而且没有任何报错。
+> `imu-soak.sh` / `start-2h-soak.sh` 也从同一个文件 source 参数，避免多处各写一份。
+
 诊断入口：
 
 ```text
 /tmp/gateway-boot.log              启动全过程（含环境变量与原始报错）
 /etc/init.d/S99gateway status      监督进程状态
 /userdata/gateway.log              网关程序日志
+```
+
+叠加层是活的还是降级了：
+
+```powershell
+adb shell "grep -E 'IMU attached|IMU unavailable' /userdata/gateway.log | tail -2"
 ```
 
 ## 已知可用条件
@@ -413,10 +499,11 @@ docs/adb-flash.md
 docs/roadmap.md
 ```
 
-项目级交接说明见：
+项目级交接说明：
 
 ```text
-docs/handoff.md
+docs/agent-handoff.md   ★ 最新，现状以此为准
+docs/handoff.md         历史快照（写于 RTSP 阶段，已在文首标注）
 ```
 
 当前验收数据、已修复缺陷根因、构建与自测说明见：
@@ -434,7 +521,8 @@ VLC / ffplay 可以打开 rtsp://172.32.0.93:8554/live/0
 多客户端（最多 4 路）同拉互不干扰
 ```
 
-长稳实测：两段共 6 小时 29 分、约 70 万帧、零丢帧。仍缺一次干净收尾的 8 小时正式验收。
+长稳实测：**8 小时干净收尾（864,001 帧 / 30.00fps / 零丢帧 / 零泄漏）**，
+另有带宽真实 IMU 的 30 分钟长稳（54000 帧 / 30.000 fps）。
 
 接下来：
 
@@ -446,9 +534,11 @@ VLC / ffplay 可以打开 rtsp://172.32.0.93:8554/live/0
 [x] 8 小时长稳正式验收（864,001 帧零丢帧零泄漏）
 [x] Mock Sensor -> OSD 数据面
 [x] OSD 接进编码流水线并上板验证
-[ ] 真实 MPU6050 接入（缺 src/mpu6050_source.c）
-[ ] OSD 并入默认生产配置（gateway.env 尚未加 --osd）
+[x] 真实 MPU6050 接入（src/mpu6050_source.c）
+[x] OSD + 真实 IMU 并入默认生产配置（gateway.env，30 分钟长稳）
+[~] 冷启动（上电 → 3A 首次收敛）完整验证 —— fail-soft 已就位，只差自然断电重启实测
 [ ] 网络断开/恢复专项测试
+[ ] 端到端延迟的正式测量（目前只有 ffplay ~0.75s 粗测）
 [ ] 架构图与演示视频
 
 更新版本的清单（含每项证据）见 `docs/agent-handoff.md`。

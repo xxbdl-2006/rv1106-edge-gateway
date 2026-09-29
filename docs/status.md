@@ -3,7 +3,14 @@
 本文档记录每一项已完成的验收、实测数据和踩过的坑。`docs/handoff.md` 描述架构和
 交接要求，本文档描述**实际测到了什么**。两者冲突时以本文档的实测数据为准。
 
-最后更新：2026-09-28
+最后更新：**2026-09-29**
+
+> 本次（2026-09-29）新增：
+> - **§1.3 OSD 上板验收** —— 300/300 帧合成成功，**帧率零开销**。
+> - **§1.4 真实 MPU6500 进生产配置** —— 30 分钟 54000 帧 30.000 fps，真拉流抽帧确认数值在动。
+> - **§2.6 bit-bang 总线成本**（新根因）—— 一次 14 字节突发 **28 ms** 而非「几毫秒」，
+>   以及由此选出的 100 ms 轮询间隔。
+> - §4 测试套件表、§5 板端操作、§6 下一步同步更新。
 
 ---
 
@@ -12,13 +19,17 @@
 | 验收项 | 标准 | 实测 | 结论 |
 | --- | --- | --- | --- |
 | 分辨率/帧率 | 1280x720 @ 30fps | 30.002 fps（30 分钟长跑） | 通过 |
-| 延迟 | < 1s | ffplay 约 0.75s | 通过 |
+| 延迟 | < 1s | ffplay 约 0.75s（**仅粗测，无文档化方法**） | 通过（弱） |
 | 客户端断开不阻塞编码 | 必须 | 无客户端时队列正常丢旧 GOP | 通过 |
 | 客户端重连可恢复 | 必须 | 重连后从下一个 IDR 开始 | 通过 |
 | 30 分钟播放不崩溃 | 必须 | 54004 帧 / 0 empty | 通过 |
 | 多客户端 | 加分项 | 4 路并发，关任一路不影响其他 | 通过 |
 | 开机自启 | 加分项 | `adb reboot` 后 11 秒自动出流 | 通过 |
 | 长期稳定性 | 8 小时 | **8 小时干净收尾（线程化，864,001 帧 / 0 丢帧）** | 见 §1 长稳数据 |
+| **OSD 叠加** | 合成不拖慢编码 | 300/300 帧合成，**30.003 fps vs 无 OSD 30.000 fps** | 通过（零开销） |
+| **真实 IMU 数据面** | 进生产配置 | 30 分钟 54000 帧 30.000 fps，**抽帧数值在变** | 见 §1.4 |
+| **传感器总线错误率** | 可接受 | 15057 次采样 1 次错误（≈7e-5） | 通过（不加重试） |
+| 网络断开/恢复 | — | **未测** | 未覆盖 |
 
 ### 长稳实测数据（ffmpeg 拉流）
 
@@ -41,7 +52,17 @@
 
 ### 尚未完成
 
-无。8 小时干净收尾已于 2026-09-28 达成（见下）。
+**功能项无：8 小时干净收尾已于 2026-09-28 达成**（见下），随后 2026-09-29 又把真实 IMU
+与 OSD 接进生产配置并跑完 30 分钟长稳（见 §1.3 / §1.4）。
+
+剩余的**全部是工程化收尾，不是功能**：
+
+```text
+[ ] 网络断开/恢复专项测试（roadmap 列了，从未跑过）
+[ ] 端到端延迟的正式测量（只有 ffplay ~0.75s 粗测，无文档化方法）
+[ ] 架构图、演示视频
+[ ] 冷启动（上电 → 3A 首次收敛）的完整验证 —— fail-soft 已就位，只差自然断电重启实测
+```
 
 ### 2 小时长稳：干净收尾已达成（2026-09-27，同步流水线）
 
@@ -153,6 +174,77 @@ bash scripts/start-2h-soak.sh --threads  # 线程化路径（需先编好）
 bash scripts/start-2h-soak.sh --hours 8  # 推到 8 小时
 ```
 
+### 1.3 OSD 上板验收：PASS，零可测开销（2026-09-29）
+
+`--osd` 跑 300 帧：
+
+```text
+annotated=300   passed_through=0   composite_refused=0
+sensor          polls=300  samples=300
+Average FPS     30.003     （无 OSD 的基线 30.000 —— 差值在噪声内）
+```
+
+**像素级判定**（不是靠肉眼，也不是靠 MAD）：
+
+| 区域 | 判定 | 实测 |
+| --- | --- | --- |
+| overlay 区 | 强像素占比（>40 灰阶变化） | **21.0%** |
+| 对照带（同帧无人为改动区） | 同上 | **0.0%** |
+
+> **为什么用「强像素占比」而不是 MAD**：overlay 是**尖锐/局部/高对比**的，
+> 而曝光漂移是**平滑/全局**的。真机上 MAD 比值只有 1.68x，强像素比有 7.8x ——
+> MAD 会把曝光漂移平均进去，把信号淹掉。**先想清楚「它和干扰在形状上差在哪」，
+> 再去统计那个形状。**
+
+一键验证脚本：`scripts/verify-osd.sh`（Windows 入口 `scripts/verify-osd.cmd`），约 40 秒。
+
+### 1.4 真实 MPU6500 进生产配置（2026-09-29）
+
+生产命令行（**唯一来源 = 仓库 `scripts/gateway.env`**）已加 `--osd --osd-source mpu6050`：
+
+```text
+GATEWAY_ARGS="-d /dev/video11 -w 1280 -H 720 --warmup 30 --sink rtsp --rtsp-port 8554
+              --threads --ring-slots 4 --quiet --osd --osd-source mpu6050"
+```
+
+**30 分钟长稳**（`bash scripts/imu-soak.sh`，`--sink rtsp`）：
+
+```text
+Captured    54000 frames        Average FPS : 30.000
+Ring        pushed=54001  dropped_busy=0  dropped_oldest=0  peak_depth=3
+OSD         annotated=54000  passed_through=0  composite_refused=0
+Sensor      polls=53672  samples=15057  no_sample=38614  errors=1
+gpio70/71   无残留
+```
+
+| 指标 | 起点 | 结束 | 判读 |
+| --- | --- | --- | --- |
+| fds | 28 | 28（30 次采样**全部** 28） | 无泄漏。28 = 基线 24 + 2 引脚×2，与 `gpio_sysfs.c` 预开 fd 的设计吻合 |
+| threads | 6 | 6 | 无线程泄漏 |
+| RSS | 17444 KB | 17960 KB | 前 11 min +440 KB，后 11 min +68 KB，末尾连停 3 点 → **热身非泄漏** |
+| CPU | 32% | 32% | 基线 14~17% → **约翻倍**（28 ms × 10 次/s ≈ 一个核的 28%） |
+| 温度 | 55.9°C | 55.9°C | 基线 52.5°C，+3.4°C |
+
+**真拉流抽帧确认叠加层到了客户端**（从 Windows 侧，这一条不能省）：
+
+```powershell
+ffmpeg -rtsp_transport tcp -i rtsp://172.32.0.93:8554/live/0 -t 8 -frames:v 2 out-%02d.png
+```
+
+两帧对比，**数值在变**（是活数据不是静态渲染）：
+
+| | 帧 1 | 帧 2 |
+| --- | --- | --- |
+| FRAME | 2438 | 2451 |
+| TEMP | 49.3 | 49.1 |
+| ROLL | +0.2 | +0.5 |
+| ACC | 1.00 | 0.99 |
+
+面板内容：`PITCH/ROLL`、`ACC/TEMP`、`STATUS FRAME/FPS`、`IMU MPU6050 OK E=0`。
+
+> ⚠️ **`annotated=N` 只证明编码器做了合成，不证明客户端收到了。**
+> `--sink rtsp` 在没有客户端连接时 RTP 根本不发包。**生产配置上线后必须真拉一次流抽帧看。**
+
 ---
 
 ## 2. 已修复的缺陷与根因
@@ -224,6 +316,70 @@ interleaved 帧交错后客户端解析器失步。
 
 `src/frame_ring.c` 和 `src/capture_thread.c` 都已按此处理。
 
+### 2.6 bit-bang 总线一次突发是 28 ms，不是「几毫秒」（2026-09-29，最贵的一个）
+
+**现象**：把真实 IMU 接进数据面后，帧率从 30 塌到 **21.359 fps**、`dropped_busy=122`。
+
+**根因**：软件 bit-bang I²C 的**一次 14 字节突发实测 ≈ 28 ms**（总线约 5kHz）。
+这个代价全部花在**喂编码器的那个线程**上。代码注释里原先写的是 "a few milliseconds"
+—— **错了十倍**，而帧率替这个错误买了单。
+
+**量化手法（值得复用）**：让采样器按 10 ms 周期跑 20 s，只拿到 **713** 个样本
+（理论 2000），反推每次循环 ≈ 28 ms。一次 `mpu6050_read()` 就是**单次 14 字节突发**
+（没有多余事务），所以 28 ms 就是总线本身的代价，不是软件开销。
+
+**模型**（`单次突发 28 ms` + `编码 ≈12 ms` vs `每帧预算 1000/采集帧率`）：
+
+```text
+采集 30 fps（33.3 ms 预算）：28 + 12 = 40 > 33.3  → 崩到 21.4 fps   ✓ 与实测吻合
+采集 25 fps（40.0 ms 预算）：40 = 40              → 勉强，掉 7 帧     ✓ 与实测吻合
+改成 100 ms 间隔 @30fps    ：每帧只摊 9.3 ms      → 21.3 < 33.3，有余量
+```
+
+**同场次三档对照**（`SWEEP_MS=10,50,100 bash scripts/fps-osd-compare.sh 300`）：
+
+| 采样间隔 | fps | dropped_busy | captured |
+| --- | --- | --- | --- |
+| none（基线） | **30.001** | 0 | 301 |
+| 10 ms | **21.409** | **122** | 426 |
+| 50 ms | 26.612 | 38 | 340 |
+| **100 ms（默认）** | **29.998** | **0** | 302 |
+
+10 ms 那档**逐字复现**了最初的故障（122 / 426 / 21.409，首次是 122 / 426 / 21.359）
+—— 它是**对照组里的「已知坏」档**，证明这台测量装置确实测得出效应。否则
+「100 ms 与基线持平」就分不清是**改好了**还是**根本没测到**。
+
+**修复**：
+
+- `MPU6050_SOURCE_DEFAULT_MIN_INTERVAL_US` 10000 → **100000**（10 Hz）。不是 100 Hz：
+  瓶颈在**总线**不在传感器。
+- 新增 `--osd-imu-interval-ms N`（0~10000，0=用默认）。**这个 flag 必须存在**：正确值
+  是那条总线的属性，只能实测找，而找的过程不能每次都回 VM 重编译一趟。
+- 日志改成 `part at 100 Hz, bus read every 100 ms` —— 把**芯片自采样率**和**总线读取率**
+  分开写。**把两者混在一起，正是这个成本被读错的原因。**
+
+> ⚠️ **跨场次比 fps 是不可信的**：同一批实验里基线出现过 25 fps，因为脚本刚新起
+> `rkaiq_3A_server`、**曝光还没收敛** → 采集只给 25 fps；收敛后才回到 30 fps。
+> **必须同场次对照**，这就是 `fps-osd-compare.sh` 存在的理由。
+> 报 fps 要连 `dropped_busy` 一起给：`0 + 低 fps` = 采集上限；`>0` = 编码真落后。
+
+### 2.7 同一份配置写在多处 → 重装会静默回退（2026-09-29）
+
+**现象**：把叠加层加进板上的 `/userdata/gateway.env` 之后，**任何一次重装或长稳都会
+把它抹掉**，而且全程没有任何报错。表征是「OSD 某天开始不见了」，排查方向会指向
+OSD 代码，而原因在一个**安装脚本**里。
+
+**根因**：生产的 `GATEWAY_ARGS` 曾同时存在于**四个地方** —— `install_autostart.ps1`
+（在内部拼字符串）、`start-2h-soak.sh`、`imu-soak.sh`、以及板上的 `/userdata/gateway.env`。
+
+**修复**：唯一来源收敛到仓库 `scripts/gateway.env` —— 安装脚本**推**它，两个长稳脚本
+**source** 它。安装脚本里唯一还自己算的是 `--quiet` 的能力检测（老二进制给了这个 flag
+会拒绝启动），且明确只改 `GATEWAY_ARGS=` 那一行。
+
+> **判据：如果一件事「改了 A 之后 B 会把它改回去」，那 A 不是配置，是副本。**
+> **另一条实践**：改配置改**仓库那份**再重装，**不要直接在板上改** —— 板上那份是副本，
+> 下一次重装会静默覆盖它。装完可用 `wc -c` + `diff` 核对两份是否逐字节一致。
+
 ---
 
 ## 3. 当前架构
@@ -231,12 +387,19 @@ interleaved 帧交错后客户端解析器失步。
 ### 3.1 两条流水线
 
 ```text
---threads 关闭（默认，已验证的稳定路径）
-  V4L2 DQBUF -> 紧致化 NV12 -> MPP 编码 -> Sink
+视频主线
+  --threads 关闭（同步路径）
+    V4L2 DQBUF -> 紧致化 NV12 -> Rockit VENC 编码 -> Sink
 
---threads 开启（本次新增）
-  采集线程: V4L2 DQBUF -> 紧致化 NV12 -> frame_ring
-  主线程  : frame_ring -> MPP 编码 -> Sink
+  --threads 开启（生产配置走的路径）
+    采集线程: V4L2 DQBUF -> 紧致化 NV12 -> frame_ring
+    主线程  : frame_ring -> Rockit VENC 编码 -> Sink
+
+传感器支线（与视频流水线刻意零交集）
+  MPU6050(bit-bang I²C) -> sensor_source -> sensor_ring -> sensor_attitude
+                        -> osd_feed(50Hz) -> osd_overlay -> 合成进编码器输入的私有副本
+
+Sink:  file | queue | rtsp (RTSP over TCP, 多客户端上限 4)
 ```
 
 ### 3.2 为什么要有 frame_ring
@@ -255,6 +418,16 @@ interleaved 帧交错后客户端解析器失步。
 src/capture_thread.c / .h   V4L2 取帧线程，通过回调把 NV12 交给 frame_ring
 src/frame_ring.c / .h       有界 NV12 帧环，创建期一次性分配，push 永不阻塞
 src/capture_signal.h        g_stop 的外部声明，信号处理/capture 循环/采集线程共用
+
+src/sensor_source.h         Sensor 抽象接口（mock 与真实 IMU 共用）
+src/mpu6050_source.c / .h   真实 MPU6050 源；convert 是纯算术（host 可测），
+                            open/read/close 在 __linux__ 内（要调驱动）
+src/mpu6050.c / .h          寄存器编解码、标定、量程换算
+src/mpu6050_i2c.c           bit-bang I²C 时序（建在 gpio_sysfs.c 之上）
+src/sensor_ring.c / .h      有界样本环（head/tail/count 模型）
+src/sensor_attitude.c / .h  pitch/roll 解算
+src/mock_sensor.c           假数据源（故障注入、wave 模式）
+src/osd_*.c / .h            OSD 各层：font / overlay / format / telemetry / feed / annotate
 ```
 
 **分层原则**：`capture_thread.c` 刻意不依赖任何 V4L2 细节，所以能在 Windows 上跑
@@ -278,7 +451,7 @@ make CROSS_COMPILE=arm-rockchip830-linux-uclibcgnueabihf-
 ### 主机自测（Windows / Linux 均可）
 
 ```bash
-make test          # 九个套件，共 1206 项检查 + 两项标志检查
+make test          # 十个测试二进制 + 两项标志检查
 make host-syntax   # MinGW 下对含 socket / V4L2 的文件做语法检查
 make board-flags   # 同上，但用板端的 CPPFLAGS/CFLAGS
 ```
@@ -291,11 +464,18 @@ make board-flags   # 同上，但用板端的 CPPFLAGS/CFLAGS
 | `test-capture-thread` | 13 | 采集成帧、warmup 过滤、故障停机、stop 不挂起 |
 | `test-mpu6050` | 105 | 寄存器编解码、标定、量程换算 |
 | `test-i2c-bitbang` | 50 | 时序边沿序列（录制式 GPIO 假后端） |
-| `test-sensor` | 667 | 数学、姿态、mock、sample ring、接口贯通 |
+| `test-mpu6050-source` | 28 | 真实 IMU 源：解码→校准→姿态、静止 `\|a\|=1.000`、量程不符必须拒绝 |
+| `test-sensor` | **622 ~ 697（浮动）** | 数学、姿态、mock、sample ring、接口贯通 |
 | `test-osd` | 143 | 点阵字体、定点格式化、1bpp 画布、遥测行 |
 | `test-osd-pipeline` | 39 | 采样节奏、陈旧样本、速率窗口、annotate 只写副本 |
 
-合计 **1206 项，0 失败**；`board-flags` 与 `host-syntax-can-fail` 另计。
+本轮实测合计 **1205 项，0 失败**（总数随 `test-sensor` 浮动，说明见下方）；
+`board-flags` 与 `host-syntax-can-fail` 另计。
+
+> **`test-sensor` 的检查项数量每次运行都不固定**（实测 622 ~ 697，**全部 PASS**）。
+> 原因：`tests/test_sensor.c` 里 `test_ring_producer_consumer()` 有一个真线程的
+> 生产者/消费者用例，每消费一个样本计一次 CHECK，消费多少取决于调度。
+> **这不是失败，别去「修」它；也别把某个固定数字写进文档。**
 
 ### MinGW 限制
 
@@ -325,6 +505,52 @@ make board-flags   # 同上，但用板端的 CPPFLAGS/CFLAGS
 /userdata/gateway-supervise.sh &
 ```
 
+### 生产命令行：唯一来源是仓库，不是板子
+
+```bash
+# 安装（只装，不碰正在跑的进程）
+powershell -File scripts/install_autostart.ps1
+# 装完立刻起
+powershell -File scripts/install_autostart.ps1 -Start
+# 让新的 GATEWAY_ARGS 生效
+adb shell "/etc/init.d/S99gateway restart"
+
+# 核对板上副本与仓库源文件是否逐字节一致
+export MSYS_NO_PATHCONV=1
+adb shell "wc -c < /userdata/gateway.env"      # 应与本地一致（当前 2522）
+diff <(tr -d '\r' < scripts/gateway.env) <(adb shell "cat /userdata/gateway.env" | tr -d '\r')
+
+# 回滚（备份是本轮之前的无 OSD 配置，仍有效）
+adb shell "cp /userdata/gateway.env.bak /userdata/gateway.env"
+adb shell "/etc/init.d/S99gateway restart"
+```
+
+> 🔴 **改配置改 `scripts/gateway.env`（仓库）再重装，不要在板上直接改** ——
+> 板上那份是它的副本，下一次重装会静默覆盖，而且没有任何报错。
+
+### 叠加层是活的还是降级了
+
+```bash
+adb shell "grep -E 'IMU attached|IMU unavailable' /userdata/gateway.log | tail -2"
+```
+
+判活必须**从另一端真拉流抽帧**（`annotated=` 计数器只证明编码器做了合成）：
+
+```powershell
+ffmpeg -rtsp_transport tcp -i rtsp://172.32.0.93:8554/live/0 -t 8 -frames:v 2 out-%02d.png
+```
+
+### 真实 IMU 的一键验证 / 长稳
+
+```bash
+bash scripts/imu-soak.sh                  # 完整长稳，**不依赖 imu-sample**
+FRAMES=300 bash scripts/imu-soak.sh       # 快速回归版
+bash scripts/verify-imu.sh                # 需要板端先编好 imu-sample（见下）
+```
+
+> ⚠️ `make clean` 之后 `imu-sample` **常被漏编**，而 `verify-imu.sh` 缺它会直接 die。
+> 快速回归请用上面那条 `FRAMES=300`。
+
 ### 长稳采样
 
 ```bash
@@ -334,8 +560,13 @@ adb shell "setsid /userdata/soak-monitor.sh 60 >/dev/null 2>&1 < /dev/null & sle
 adb shell "kill \$(cat /tmp/soak-monitor.pid)"
 ```
 
-健康基线（无客户端）：**RSS 11.5MB、fds 24、threads 5、CPU 14~17%、温度 52.5°C、
-可用内存 155MB**。长稳要看的是这些数字**是否随时间单调上升**，而不是绝对值。
+健康基线（无客户端、无 OSD）：**RSS 11.5MB、fds 24、threads 5、CPU 14~17%、
+温度 52.5°C、可用内存 155MB**。长稳要看的是这些数字**是否随时间单调上升**，而不是绝对值。
+
+**开了真实 IMU 叠加后**（生产配置，2026-09-29）：**fds 28**（= 24 + 2 引脚×2）、
+**threads 6**、**CPU 32%**、**温度 55.9°C**、RSS 17.4~18.0MB。这些是 IMU 的固定代价，
+不是泄漏 —— 但判据不变：看尾部是否仍在爬。`--quiet` 下**线程数是唯一判据**
+（日志被抑制了）。
 
 ### 拉流
 
@@ -384,6 +615,26 @@ powercfg /change hibernate-timeout-ac 0
 3. **✅ `S99gateway restart` 白等 20 秒已修复**（见 §7），并顺带修掉了
    `LD_LIBRARY_PATH` 重复追加（`S99gateway` 与 `gateway-supervise.sh` **两处都有**）、
    以及 Windows 检出导致的 CRLF shebang 问题。
+4. **✅ Mock Sensor → OSD 数据面已完成**（2026-09-29，见 §1.3）：`sensor_source` 接口、
+   有界样本环、姿态解算、1bpp 画布 OSD 全部实现；`--osd` 上板 300/300 帧合成成功，
+   **帧率零开销**。
+5. **✅ 真实 MPU6500 接进数据面并进入生产配置**（2026-09-29，见 §1.4 与 §2.6）：
+   `mpu6050_source` 实现 `sensor_source`，`--osd-source mpu6050` 已进 `gateway.env`；
+   30 分钟 54000 帧 30.000 fps；解决了 bit-bang 总线 28 ms 导致的帧率塌陷
+   （根因与三档对照见 §2.6）。
+6. **✅ 生产配置收敛为单一来源**（2026-09-29，见 §2.7）：`scripts/gateway.env`。
+
+**剩下的是 P2 工程化收尾，都不是功能**：
+
+```text
+[x] README.md / docs/handoff.md / roadmap.md 过时表述（2026-09-29 已对齐现状）
+[ ] 网络断开/恢复专项测试（roadmap 列了，从未跑过）
+[ ] 端到端延迟的正式测量（只有 ffplay ~0.75s 粗测）
+[ ] 架构图、演示视频
+[ ] 冷启动（上电 → 3A 首次收敛）的完整验证 —— fail-soft 已就位，只差自然断电重启实测
+```
+
+> 最新、最全的完成清单与每项证据见 **`docs/agent-handoff.md`**。
 
 ---
 
