@@ -195,13 +195,47 @@ Average FPS : 25.000   dropped_busy=0   annotated=300 composite_refused=0
 —— 它是**对照组里的"已知坏"档**，证明这台测量装置确实能测出效应，
 否则"100 ms 与基线持平"就分不清是改好了还是根本没测到。50 ms 仍不够（拐点在 50~100 之间）。
 
-**结论：100 ms 这个默认值是实测选出来的，`--osd-source mpu6050` 已具备进 `gateway.env` 的条件**
-（见 P1）。`--osd-imu-interval-ms` 现在只是留给将来换板子的旋钮，日常不需要显式写。
+**结论：100 ms 这个默认值是实测选出来的。**`--osd-imu-interval-ms` 现在只是留给将来换板子的
+旋钮，日常不需要显式写。
+
+#### 30 分钟长稳（2026-09-29 14:25~15:05，`bash scripts/imu-soak.sh`）
+
+跑的是 `/userdata/gateway.env` 那条命令行原样加 `--osd --osd-source mpu6050`，**`--sink rtsp`**
+—— 所以这也是第一次带 OSD 的真实推流（下面 P1 里"没跑过"那条已消除）：
+
+```
+Captured 54000 frames        Average FPS : 30.000
+Ring      pushed=54001  dropped_busy=0  dropped_oldest=0  peak_depth=3
+OSD       annotated=54000  passed_through=0  composite_refused=0
+Sensor    polls=53672  samples=15057  no_sample=38614  errors=1
+gpio70/71 无残留
+```
+
+| 指标 | 起始 | 结束 | 判读 |
+|---|---|---|---|
+| fds | 28 | 28（30 次采样**全部** 28） | 无泄漏。28 = 基线 24 + 2 引脚×2，与 `gpio_sysfs.c` 预开 fd 的设计吻合 |
+| threads | 6 | 6 | 无线程泄漏 |
+| RSS | 17444 KB | 17960 KB | **前 11 min +440 KB，后 11 min +68 KB，末尾连停 3 个采样点** → 分配器热身，不是泄漏 |
+| CPU | 32% | 32% | 基线 14~17% → **约翻倍**，见下 |
+| 温度 | 55.9°C | 55.9°C（稳态） | 基线 52.5°C，+3.4°C |
+
+- ✅ **满帧**：整场 `30.000 fps`、`dropped_busy=0` —— 帧率问题到此闭环。
+- ⚠️ **`errors=1`**：15057 次采样里 1 次总线错误（≈7e-5）。软件 bit-bang I²C 的固有特性，
+  不是回归。程序行为正确：标记 stale、沿用上一姿态，不崩不泄漏（host 单测覆盖了
+  "failing source 与 quiet source 可区分"）。**不建议为它加重试** —— 重试路径在板上
+  无法被确定性地触发，而一段没被验证过的错误恢复代码本身就是负债。
+- ⚠️ **CPU 32%（基线 14~17%）**：单次突发 28 ms × 10 次/s ≈ 一个核的 28%。这是选
+  100 ms 而非 10 ms 的另一条理由（10 ms 会把 CPU 打满，正是当初掉到 21 fps 的原因）。
+  要省 CPU 就把间隔调到 200 ms，减半，显示上无差别。
 
 ### P1 — 决策：OSD 是否并入默认生产配置
 
-- 当前 OSD 只在 `--sink file` 路径上做过板端验证；**`--sink rtsp` 带 OSD 的真实推流还没跑过**。
-- 如果开：编辑 `/userdata/gateway.env` 加 `--osd --osd-source mock`（先 mock），或直接接 P0 的真源。
+- **`--sink rtsp` 带 OSD 已跑过 30 分钟**（见上），不再是未知项。
+- 唯一前置：`src/v4l2_mpp_encode.c` 的 **fail-soft** 改动（`f724774`）还没编译进板端二进制。
+  没有它，开机时 IMU 不在会直接让网关退出（症状是"开机无流"，而原因是个外设）。
+  有了它，缺 IMU 只是没有叠加层，视频照推。
+- 届时编辑 `/userdata/gateway.env` 加 `--osd --osd-source mpu6050` 即可。
+  **不要**先上 mock：mock 是假数据，真源已经验证过了。
 
 ### P2 — 工程化收尾
 
