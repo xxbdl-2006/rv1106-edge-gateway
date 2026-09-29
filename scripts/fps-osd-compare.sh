@@ -162,6 +162,10 @@ restore_gateway() {
 
     step "restoring the gateway"
 
+    # Waited for here too: this is the last thing the script does, and giving up
+    # on it is what leaves the board with no gateway at all.
+    require_adb || return 0
+
     adb shell "/etc/init.d/S99gateway start" >/dev/null 2>&1
 
     local waited=0
@@ -195,6 +199,11 @@ run_config() {
 
     printf '\n--- %s ---\n' "$label"
 
+    # Checked before every run, not just once at the top: the link has dropped
+    # in the middle of a sweep, and a configuration measured while the board
+    # was unreachable produces an empty row that looks like a result.
+    require_adb || return 1
+
     adb shell ". /etc/profile.d/RkEnv.sh >/dev/null 2>&1; cd $BOARD_DIR && \
 ./$BINARY -d /dev/video11 -w 1280 -H 720 --warmup 30 --sink file \
 -o $out --threads --ring-slots 4 --frames $FRAMES $*" 2>&1 \
@@ -216,6 +225,41 @@ run_config() {
     RESULT_SKIPPED="$skipped"
 }
 
+# One retry, because the link dropping mid run costs a whole configuration and
+# a sweep is only worth anything if every row was really measured.
+run_config_once() {
+    run_config "$@"
+    if [ -z "${RESULT_FPS:-}" ]; then
+        note "no result, waiting for the board and retrying"
+        require_adb && run_config "$@"
+    fi
+}
+
+# Which interval actually costs nothing is a question about the bus, not about
+# the code, so it is answered by sweeping. Set SWEEP_MS to a comma separated
+# list and this replaces the three fixed configurations with a baseline plus one
+# run per interval - all in the same session, which is the only way the numbers
+# mean anything (see the header).
+#
+# The 10 ms point is kept in every sweep on purpose. It is the value that was
+# proven to cost 30 fps, so it is the control: if it does not still lose frames
+# here, the measurement is not measuring what it claims to.
+run_sweep() {
+    run_config_once none
+    printf '\n  baseline (no overlay): %s fps\n' "$RESULT_FPS"
+
+    local ms
+    for ms in $(printf '%s' "$SWEEP_MS" | tr ',' ' '); do
+        run_config_once "imu-${ms}ms" --osd --osd-source mpu6050 \
+            --osd-imu-interval-ms "$ms"
+    done
+
+    step "result"
+    printf '  Read each row against the baseline above. The interval is right\n'
+    printf '  when the frame rate stops moving and dropped_busy stays at 0.\n'
+    printf '  Logs: %s\n' "$WORK_DIR"
+}
+
 main() {
     rm -rf "$WORK_DIR"
     mkdir -p "$WORK_DIR"
@@ -228,6 +272,11 @@ main() {
         || die "$BINARY is not ARM. Rebuild with CROSS_COMPILE set."
 
     stop_gateway
+
+    if [ -n "${SWEEP_MS:-}" ]; then
+        run_sweep
+        return 0
+    fi
 
     local local_size board_size attempt=0
     local_size="$(wc -c < "$REPO_DIR/$BINARY")"
@@ -246,13 +295,13 @@ main() {
 
     step "three configurations, ${FRAMES} frames each"
 
-    run_config none
+    run_config_once none
     local fps_none="$RESULT_FPS" drop_none="$RESULT_DROPPED"
 
-    run_config mock --osd --osd-source mock
+    run_config_once mock --osd --osd-source mock
     local fps_mock="$RESULT_FPS" drop_mock="$RESULT_DROPPED"
 
-    run_config mpu6050 --osd --osd-source mpu6050
+    run_config_once mpu6050 --osd --osd-source mpu6050
     local fps_imu="$RESULT_FPS" drop_imu="$RESULT_DROPPED"
 
     step "result"

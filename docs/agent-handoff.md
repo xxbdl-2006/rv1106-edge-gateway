@@ -169,22 +169,34 @@ Average FPS : 21.359      dropped_busy=122      ← 基线 30.001
 - 日志行改成 `part at 100 Hz, bus read every N ms`：把"芯片自采样率"和"总线读取率"
   分开写，混在一起正是这个成本被读错的原因。
 
-**还剩：重新编译后复验（唯一阻塞项）**
+**复验完成：修复有效**（2026-09-29 14:07~14:10）
 
-```bash
-# 1) 在 VM 里（Windows 没有 ARM 工具链，进不去 VM，只能手动）
-cd /mnt/hgfs/luckfox_share/rv1103
-make clean && make CROSS_COMPILE=arm-rockchip830-linux-uclibcgnueabihf-
-make CROSS_COMPILE=arm-rockchip830-linux-uclibcgnueabihf- imu-sample
-# 2) 回 Windows
-bash scripts/verify-imu.sh          # 看 fps 是否回到 30
-bash scripts/fps-osd-compare.sh     # 同场次对照
+`bash scripts/verify-imu.sh`（间隔 100 ms）：
+
+```
+WHO_AM_I=0x70   samples=191 / 20 s = 9.6 Hz   idle=1810   errors=0
+静止 |a| = 0.995 g          gpio70/71 无残留
+OSD: part at 100 Hz, bus read every 100 ms
+Average FPS : 25.000   dropped_busy=0   annotated=300 composite_refused=0
 ```
 
-复验时顺便扫一遍间隔确认拐点（一次编译即可，靠 flag）：
-`--osd-imu-interval-ms 10 / 50 / 100 / 200`。
+25 fps 是那场的**采集**上限（3A 刚起未收敛），关键数字是 `dropped_busy` **122 → 0**。
 
-**在拿到 30 fps 的复验结果前，不要把 `--osd-source mpu6050` 写进 `/userdata/gateway.env`。**
+`SWEEP_MS=10,50,100 bash scripts/fps-osd-compare.sh 300`（**同一场次**，3A 已收敛，基线 30 fps）：
+
+| 采样间隔 | fps | dropped_busy | captured |
+|---|---|---|---|
+| none（基线） | **30.001** | 0 | 301 |
+| 10 ms | **21.409** | **122** | 426 |
+| 50 ms | 26.612 | 38 | 340 |
+| **100 ms（默认）** | **29.998** | **0** | 302 |
+
+读法：10 ms 那档**逐字复现**了最初的故障（122 / 426 / 21.409，首次是 122 / 426 / 21.359）
+—— 它是**对照组里的"已知坏"档**，证明这台测量装置确实能测出效应，
+否则"100 ms 与基线持平"就分不清是改好了还是根本没测到。50 ms 仍不够（拐点在 50~100 之间）。
+
+**结论：100 ms 这个默认值是实测选出来的，`--osd-source mpu6050` 已具备进 `gateway.env` 的条件**
+（见 P1）。`--osd-imu-interval-ms` 现在只是留给将来换板子的旋钮，日常不需要显式写。
 
 ### P1 — 决策：OSD 是否并入默认生产配置
 
