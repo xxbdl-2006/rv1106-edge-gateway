@@ -277,8 +277,8 @@ gpio70/71 无残留
 | 网络断开/恢复的专项测试 | roadmap 列了，**没跑过**（仍待做） |
 | 架构图、演示视频 | roadmap「最终交付物」列出，**未产出**（仍待做） |
 | 延迟的正式测量 | 只有 ffplay 约 0.75s 的粗测，无文档化方法（仍待做） |
-| 冷启动（上电 → 3A 首次收敛）完整验证 | ✅ **已做，并发现+修复严重缺陷**（每次上电都不出流，见 §7.6 / status.md §2.8） |
-| restart 端到端回归 | ⚠️ 本轮被 USB 掉链打断；新判据已静态验证（`wait_for_late_rkipc` 在 restart 场景立即返回） |
+| 冷启动（上电 → 3A 首次收敛）完整验证 | ✅ **已做（含物理拔插断电重启），并发现+修复严重缺陷**（每次上电都不出流，见 §7.6 / status.md §2.8） |
+| restart 端到端回归 | ✅ **PASS**：接管 4 秒、走"没人会来"分支、零白等、拉流成功（status.md §2.8 复验三） |
 | 仓库根目录有一批散落的测试 `.exe` 与 `op.log`、`.prev` | 已被 .gitignore 覆盖，git 状态干净 |
 
 ---
@@ -445,11 +445,17 @@ ffmpeg -rtsp_transport tcp -i rtsp://172.32.0.93:8554/live/0 -t 8 -frames:v 2 ou
 （等 rkipc 进程与 `/dev/video11` 都真正空闲），并新增"rkipc 退出后若还有**别的**
 进程占着节点就大声失败"的断言。
 
-**验证**：冷启动 PASS（boot+5 `start requested` → boot+19 `gateway up`，
-`rkipc appeared late (uptime 9s)`）、8554 在听、真拉流抽帧面板正常；
-restart 场景新判据 529s→530s 立即返回，零回归。
+**验证**（三次，逐次加强）：
 
-> 🔴 **「开机 11 秒出流」已作废**，正确值是**上电到出流约 19 秒**（接管 14s，含等厂商链 ~4s）。
+1. `adb reboot` 冷启动 PASS：`boot+5 start requested` → `boot+9 rkipc appeared late (uptime 9s)`
+   → `boot+19 gateway up`。
+2. **物理拔插断电重启 PASS**（最严格的一次：板子由 USB 供电，连 IMU 与摄像头一起上电
+   的那段也真的走过了）——`uptime` 从 544s 归零到 37.6s、`/tmp` 已清空，boot log 同样
+   `rkipc appeared late (uptime 9s)`；8554 在听、真拉流抽帧面板数值正常。
+3. **restart 端到端回归 PASS**：接管 4 秒、`no rkipc, nothing is initialising ... proceeding`
+   同一秒内返回（**没把上一轮修的「白等」改回来**）、`/dev/video11 is free`、拉流成功。
+
+> 🔴 **「开机 11 秒出流」已作废**，正确值是**上电到出流约 19~20 秒**（接管 14s，含等厂商链 ~4s）。
 > 另外 `install_autostart.ps1` 里"禁用 rkipc init 脚本"一步在这块板上是**空操作**
 > （日志：`no rkipc init script found`）—— rkipc 不是 init.d 起的。
 >
@@ -484,9 +490,8 @@ restart 场景新判据 529s→530s 立即返回，零回归。
    `adb shell "grep -E 'IMU attached|IMU unavailable' /userdata/gateway.log | tail -2"`
 2. **P0/P1 已全部完成**（真实 IMU 进生产配置，见 §2.4 与 §3 P1）。
    **P2 的文档纠偏也已完成**（README / handoff / status / roadmap 四份已对齐现状，见 §3 P2 表）。
-   **冷启动验证已完成并顺带修掉一个严重缺陷**（§7.6）。
+   **冷启动验证已完成（含物理断电重启）并顺带修掉一个严重缺陷**；restart 回归也 PASS（§7.6）。
    剩余 P2：网络断线恢复测试、端到端延迟正式测量、架构图、演示视频 —— **都是功能之外的活**。
-   另有一项技术债：restart 端到端回归被 USB 掉链打断，只做了新判据的静态验证，**链路恢复后应重跑一次**。
 3. 改代码前的基线：`mingw32-make test`（现为 **10 个测试二进制套件全绿**，
    合计约 1205 项 0 失败；外加 `board-flags` 与 `host-syntax-can-fail` 两项标志检查。
    `test-sensor` 的项数每次运行浮动，属正常），再动代码。

@@ -63,11 +63,10 @@
 剩余的**全部是工程化收尾，不是功能**：
 
 ```text
-[x] 冷启动（上电 → 3A 首次收敛）完整验证 —— 已做，并因此发现+修复一个严重缺陷（§2.8）
+[x] 冷启动（上电 → 3A 首次收敛）完整验证 —— 已做（含**物理断电重启**），并发现+修复一个严重缺陷（§2.8）
 [ ] 网络断开/恢复专项测试（roadmap 列了，从未跑过）
 [ ] 端到端延迟的正式测量（只有 ffplay ~0.75s 粗测，无文档化方法）
 [ ] 架构图、演示视频
-[ ] restart 端到端回归（本轮被 USB 掉链打断，只做了新判据的静态验证，见 §2.8 末）
 ```
 
 ### 2 小时长稳：干净收尾已达成（2026-09-27，同步流水线）
@@ -456,7 +455,7 @@ RkLunch.sh:
    并新增一条断言——rkipc 退出后如果还有**别的**进程占着节点，大声失败（而不是带着
    "device busy" 硬起）。
 
-**复验：冷启动 PASS**（同一条路径，跑修好的脚本）
+**复验一：`adb reboot` 冷启动 PASS**（同一条路径，跑修好的脚本）
 
 ```text
 14:20:28 start requested
@@ -479,16 +478,41 @@ RkLunch.sh:
 `IMU attached WHO_AM_I=0x70`；真拉流抽帧两帧成功，面板数值正常
 （`PITCH -0.4 ROLL +3.3 / ACC 0.99g TEMP 46.3C / FRAME 1231 30.0 FPS / IMU MPU6050 OK E=0`）。
 
-**restart 零回归**（板上静态验证新判据）：
+**复验二：真实物理断电重启也 PASS**（拔插 USB —— 板子由 USB 供电，这是**最严格**的一次：
+连 IMU 和摄像头一起上电的那一段也真的走过了，正是交接文档说"从未验证"的场景）
 
 ```text
-uptime_seconds       = 529
-vendor_chain_running -> RUNNING（RkLunch.sh 长期残留，符合预期）
-wait_for_late_rkipc  -> 返回 1，529s -> 530s      <-- 立即返回，没有白等 30 秒
+12:00:06 start requested
+12:00:09 rkipc appeared late (uptime 9s), it was on its way after all
+12:00:10 rkipc is streaming, taking the camera over
+12:00:15 rkipc is gone, /dev/video11 is free
+12:00:18 3A server running as 1676
+12:00:20 gateway is up, supervisor pid 1690
 ```
 
+（`uptime` 从 544s 归零到 37.6s、`/tmp` 被清空 → 确认是真上电，不是软重启。）
+产出：8554 在听、`IMU attached WHO_AM_I=0x70`、真拉流抽帧面板数值正常
+（`PITCH -0.2 ROLL +0.3 / ACC 1.00g TEMP 47.5C / FRAME 1111 30.3 FPS`）。
+
+**复验三：restart 端到端回归 PASS，且零白等**
+
+```text
+12:01:12 stop requested
+12:01:15 start requested
+12:01:15 no rkipc, nothing is initialising the camera, proceeding   <-- 正确分支
+12:01:17 rkipc is gone, /dev/video11 is free
+12:01:17 3A server already running
+12:01:19 gateway is up, supervisor pid 2374
+```
+
+**接管 4 秒**；`wait_for_late_rkipc` 在**同一秒内**返回（uptime 已过 30s 阈值 → 立即判定
+"没人会来"），**没有把上一轮修的「白等 20 秒」改回来**。重启后真拉流两帧成功。
+
+> 早先还做过一次判据的静态验证（`uptime_seconds=529`、`vendor_chain_running=RUNNING`、
+> `wait_for_late_rkipc` 529s→530s 立即返回），与端到端结果一致。
+
 > 🔴 **"开机 11 秒出流"这个数字要作废。** 它测的是一个**不可靠的路径**（S99gateway
-> 恰好晚于 rkipc 时）。现在的诚实数字是 **上电到出流约 19 秒**（接管本身 14 秒，
+> 恰好晚于 rkipc 时）。现在的诚实数字是 **上电到出流约 19~20 秒**（接管本身 14 秒，
 > 其中包含等厂商链的 ~4 秒——这是必须付的代价），而旧代码在冷启动下是**永不**出流。
 >
 > 顺带纠正一条相关记录：`install_autostart.ps1` 里"禁用 rkipc init 脚本"那一步
@@ -759,11 +783,11 @@ powercfg /change hibernate-timeout-ac 0
 
 ```text
 [x] README.md / docs/handoff.md / roadmap.md 过时表述（2026-09-29 已对齐现状）
-[x] 冷启动（上电 → 3A 首次收敛）完整验证 —— 已做，并发现+修复严重缺陷（§2.8）
+[x] 冷启动（上电 → 3A 首次收敛）完整验证 —— 已做（含物理断电重启），并发现+修复严重缺陷（§2.8）
+[x] restart 端到端回归 —— PASS，接管 4 秒，零白等（§2.8）
 [ ] 网络断开/恢复专项测试（roadmap 列了，从未跑过）
 [ ] 端到端延迟的正式测量（只有 ffplay ~0.75s 粗测）
 [ ] 架构图、演示视频
-[ ] restart 端到端回归（本轮被 USB 掉链打断）
 ```
 
 > 最新、最全的完成清单与每项证据见 **`docs/agent-handoff.md`**。
