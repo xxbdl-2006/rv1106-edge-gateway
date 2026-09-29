@@ -1,7 +1,7 @@
 # 项目对接文档（给下一个 Agent）
 
-> 建立时间：2026-09-29 12:10（GMT+8）
-> 仓库：`github.com/xxbdl-2006/rv1106-edge-gateway`，分支 `main`，HEAD = `4c39f13`，工作区干净。
+> 建立时间：2026-09-29 12:10（GMT+8），最后更新 2026-09-29 12:5x（P0 真实 IMU 源已落地，待上板验证）。
+> 仓库：`github.com/xxbdl-2006/rv1106-edge-gateway`，分支 `main`，HEAD = `4c39f13`，工作区有未提交改动（见 §3 P0）。
 > 本文件由实测整理而成，**与 `README.md` / `docs/handoff.md` 冲突时以本文件为准**（那两份文档已过时，见 §8）。
 
 ---
@@ -15,8 +15,12 @@
         OSD 支线已通到「能烧进码流」，但喂它的数据目前还是 mock（假）的。
 
 当前可对外播放：rtsp://172.32.0.93:8554/live/0  （1280x720 H.264，30fps）
-当前最大缺口  ：src/mpu6050_source.c 不存在 —— 真实 IMU 数据还没接进来。
+当前最大缺口  ：**真实 IMU 源已写好（src/mpu6050_source.c + tools/imu_sample.c），但还没在板子上跑过一次。**
+                Windows 侧 9 套单测全绿（新增 test-mpu6050-source 28 项），交叉编译与板端验证待 VM。
 ```
+
+**下一步只有一件事**：在 VM 编译 → 回 Windows 跑 `bash scripts/verify-imu.sh`。在那之前，
+「真实 IMU 接进来了」这句话只能算代码事实，不算实测事实。
 
 维基式结论：**主线闭环完成且验证充分；支线缺最后一段数据源。**
 
@@ -61,7 +65,8 @@
 - 板端黄金对照仍在：`/userdata/i2c-bitbang.py`（Python 版，同一块板同一颗芯片同一组引脚）。
   **Python 找得到而 C 版找不到 = 移植错了，不是硬件问题。**
 
-🔴 **未完成的部分**：`src/mpu6050_source.c` **文件根本不存在**。主程序的 `--osd-source SRC` 只接受 `mock`。
+**数据面接缝已接上（2026-09-29）**：新增 `src/mpu6050_source.{h,c}`（实现 `sensor_source` 接口）
+与 `tools/imu_sample.c`（板端取数工具）。`--osd-source mpu6050` 已可选。**尚未上板验证**，见 §3。
 
 ### 2.3 Sensor 数据面 —— 已完成
 
@@ -82,19 +87,54 @@
 
 ## 3. 未完成（按推荐优先级）
 
-### P0 — 真实 IMU 数据源（唯一的架构性缺口）
+### P0 — 真实 IMU 数据源：**代码已写完，剩上板验证**（2026-09-29）
 
-- **目标**：让 `--osd-source mpu6050` 可用，屏幕上出现真实姿态。
-- **缺失文件**：`src/mpu6050_source.c`（不存在）。
-- **契约照抄**：`sensor_source.h` 的 `struct sensor_source` 接口，参考实现 `mock_sensor.c`。
-- **底层已经好了**：`mpu6050_open / mpu6050_read_accel_gyro / mpu6050_apply_calibration` 都在 `src/mpu6050.c`，上板跑过。
-- **改哪里接线**：`src/v4l2_mpp_encode.c` 的 `--osd-source` 解析（当前只认 `mock`，帮助文本在 ~line 116）。
-- **验收判据**（抄 §16 传感器标准 + 本项目约束）：
-  - 静止时 `|a|` 校准后必须是 `1.000 ± 0.02` —— **不是 0.000**（0.000 = 偏置把重力吃掉了）；
-  - 校准前的原始 `|a|` 约 1.05，校准后要求回到 1.000，两者都要打印，差值就是这份倾斜；
-  - 100 Hz 连续 10 分钟 `0 io error`；
-  - **引脚自清理**：跑完 `gpio70/71` 无残留 export。
-- **注意**：bit-bang I2C 走的是 GPIO 而非 `/dev/i2c-N`，板上**没有** i2c 设备节点，别去找。
+**已完成（Windows 侧全绿，9 套单测）**
+
+- `src/mpu6050_source.{h,c}`：实现 `sensor_source` 接口。分两半——`mpu6050_source_convert()`
+  是纯算术（解码样本 → 校准 → 工程单位 → 姿态），**host 可测**；open/read/close 包在
+  `#ifdef __linux__` 里（要调 `mpu6050_open/read`，只在板端存在），沿用驱动原有的分层。
+- `src/v4l2_mpp_encode.c`：`--osd-source` 现在接受 `mock` 或 `mpu6050`；cleanup 改为
+  **通过 `osd_source.close(context)` 关闭**，不再按类型分支（两种源各自管自己的收尾，
+  IMU 还要释放 gpio70/71）。
+- `tools/imu_sample.c`：板端工具，通过 **sensor_source 接口本身**（而不只是驱动）取数，
+  每秒打印 samples/idle/errors 与 `|a|/pitch/roll/temp`，并据此退出。
+  `make CROSS_COMPILE=...- imu-sample`。
+- `tests/test_mpu6050_source.c`：28 项。钉死三件事：静止校准后 `|a| = 1.000`（实测 0.9999），
+  未校准 `|a| = 1.0617`（模块倾斜，不是误差，必须保持），零向量不产生 attitude。
+  **量程不符必须拒绝**（4g scale 配 2g 偏置 → 返回 -1），且失败时 `out` 被清零而非留旧值。
+- `scripts/verify-imu.sh`：Windows 侧一键验证（推二进制 → 停网关 → 跑 imu-sample →
+  查 gpio 残留 → 带 OSD 录 300 帧 → 还原网关，EXIT trap 保证还原）。
+
+**关键设计决定（改之前先读）**
+
+- **量程不可配置**：偏置是**原始计数**，只在 ±2g / ±250dps 下有意义。source 内部固定写
+  `MPU6050_CAL_ACCEL_FSR` / `_GYRO_FSR`，`convert()` 还会用传进来的 scale 反查一次。
+  静默地在 4g 下减 2g 的偏置会得到 0.98g ——落在所有容差内且是错的。
+- **source 自带限流**（默认 10 ms）：bit-bang 一次突发几毫秒，全花在喂编码器的那个线程上。
+  窗口内的 read 返回 **0（空闲）而不是错误**——接口本来就有这个语义，只有这一层知道区别。
+- **姿态是相对"标定时的安装角"**，不是相对世界水平：单点标定分不清倾斜和零偏，
+  X/Y 的偏置里本来就含那 9.3°。要真正分开得做六面翻转，等安装固定了再说。
+
+**还剩：上板验证（30 分钟，唯一阻塞项）**
+
+```bash
+# 1) 在 VM 里（Windows 没有 ARM 工具链，进不去 VM，只能手动）
+cd /mnt/hgfs/luckfox_share/rv1103
+make clean && make CROSS_COMPILE=arm-rockchip830-linux-uclibcgnueabihf-
+make CROSS_COMPILE=arm-rockchip830-linux-uclibcgnueabihf- imu-sample
+# 2) 回 Windows
+bash scripts/verify-imu.sh
+```
+
+**验收判据**（脚本已自动判）：WHO_AM_I 有值（本板 0x70）；samples 连续、errors=0；
+静止 `|a| = 1.000 ± 0.02`（**不是 0.000**，不是 1.062）；`annotated=300 composite_refused=0`；
+跑完 `gpio70/71` 无残留 export；fps 不塌（基线 30.000）。
+
+**已知风险**：OSD 轮询 50 Hz × 每次 I²C 突发几毫秒，可能吃掉喂帧线程的预算。
+上板第一次跑要看 fps 那一行；若塌了，把 `MPU6050_SOURCE_DEFAULT_MIN_INTERVAL_US`
+从 10000 调大（20~50 ms 对显示完全够），或把采样挪到独立线程。**不要**在没测 fps 的情况下
+直接把 `--osd-source mpu6050` 写进 `/userdata/gateway.env`。
 
 ### P1 — 决策：OSD 是否并入默认生产配置
 
@@ -136,6 +176,9 @@ bash scripts/verify-osd.sh --verify-only   # 或双击 scripts/verify-osd.cmd
 
 # MPU6050 驱动一键验证
 bash scripts/verify-mpu6050.sh            # 第 1 步（找工具链）只能在 VM 跑
+
+# 真实 IMU 源一键验证（Windows；二进制需先在 VM 编好）
+bash scripts/verify-imu.sh
 
 # 网关状态（判活用进程名 v4l2_mpp_encode，不是 gateway）
 adb shell "pidof v4l2_mpp_encode; pidof gateway-supervise.sh; pidof rkaiq_3A_server"
@@ -232,7 +275,11 @@ adb shell "pidof v4l2_mpp_encode; pidof gateway-supervise.sh; pidof rkaiq_3A_ser
 
 1. 先确认板子还在推流（30 秒）：
    `adb shell "pidof v4l2_mpp_encode && netstat -tln | grep 8554"`
-2. 决定走哪条路，二选一：
-   - **做 P0（推荐）**：新建 `src/mpu6050_source.c`，实现 `sensor_source` 接口，把已有驱动接进去；先在 Windows 写单测（`make test` 框架里加 `test-mpu6050-source`），再走 VM 编译 → Windows 推板 → `scripts/verify-osd.sh`。
-   - **做 P1/P2**：把 OSD 并入 `/userdata/gateway.env`，或用 `--sink rtsp` 做一次带 OSD 的真实推流验证。
-3. 无论做哪个：**先跑一遍 `mingw32-make test`** 拿到绿基线，再动代码。
+2. **P0 收尾（推荐，唯一阻塞项）**：二进制是否已带新代码？
+   `adb shell "wc -c < /userdata/v4l2_mpp_encode"` 与本地 `v4l2_mpp_encode` 比字节数，
+   且 `od -An -tx1 -j18 -N2 v4l2_mpp_encode` 必须是 `28 00`。
+   如果 VM 已经编好 → 直接 `bash scripts/verify-imu.sh`（脚本会先自己查这两项）。
+   如果还没编 → 把 §3 P0 里的两条 make 命令交给用户在 VM 跑，然后回来跑脚本。
+3. 验证 PASS 之后再做 P1（OSD 是否并入 `/userdata/gateway.env`）：**先 mock，再真源**，
+   且必须先看 fps 有没有掉。
+4. 无论做哪个：**先跑一遍 `mingw32-make test`** 拿到绿基线（现为 9 套），再动代码。

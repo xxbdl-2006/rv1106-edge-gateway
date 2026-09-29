@@ -14,6 +14,7 @@
 #include "capture_thread.h"
 #include "frame_ring.h"
 #include "mock_sensor.h"
+#include "mpu6050_source.h"
 #include "mpp_encoder.h"
 #include "osd_annotate.h"
 #include "osd_feed.h"
@@ -113,9 +114,10 @@ static void print_usage(const char *program)
             "      --threads         capture on its own thread via a frame ring\n"
             "      --ring-slots N    frame ring depth when --threads (default: %u)\n"
             "      --osd             burn the sensor overlay into the video\n"
-            "      --osd-source SRC  sensor source for the overlay: mock\n"
-            "                        (default: %s). Only mock exists so far; the\n"
-            "                        MPU6050 source lands next.\n"
+            "      --osd-source SRC  sensor source for the overlay: mock or\n"
+            "                        mpu6050 (default: %s). mpu6050 reads the\n"
+            "                        IMU on header pins 24/14 over bit-banged\n"
+            "                        I2C; --osd-mode only affects mock.\n"
             "      --osd-mode M      mock waveform: level, wave or ramp\n"
             "                        (default: %s)\n"
             "      --osd-amplitude D wave amplitude in degrees (default: %u)\n"
@@ -446,13 +448,14 @@ int main(int argc, char **argv)
 
     /*
      * Overlay state, all owned here. `telemetry` is handed to the annotator on
-     * success and set to NULL so cleanup does not release it twice; the mock
-     * sensor is held separately because the feed borrows it rather than owning
-     * it.
+     * success and set to NULL so cleanup does not release it twice. The sensor
+     * itself is reached through osd_source and closed through its close hook
+     * rather than by type: two sources exist now, and a cleanup path that knew
+     * which one was opened would be a third place that has to agree with the
+     * option parse.
      */
-    struct mock_sensor_config osd_config;
-    struct mock_sensor *osd_sensor = NULL;
     struct sensor_source osd_source;
+    struct mpu6050_sensor *osd_imu = NULL;
     struct osd_feed *feed = NULL;
     struct osd_telemetry *telemetry = NULL;
     struct osd_annotate *annotator = NULL;
@@ -604,14 +607,15 @@ int main(int argc, char **argv)
             break;
         case 1006:
             /*
-             * Only the mock exists so far. The check is here rather than left to
-             * fail later so that a typo in a startup script reports itself at
-             * parse time, when the message can still name the flag, instead of
-             * surfacing as an overlay that quietly shows nothing.
+             * Checked here rather than left to fail later so that a typo in a
+             * startup script reports itself at parse time, when the message can
+             * still name the flag, instead of surfacing as an overlay that
+             * quietly shows nothing.
              */
-            if (strcmp(optarg, "mock") != 0) {
+            if (strcmp(optarg, "mock") != 0 &&
+                strcmp(optarg, "mpu6050") != 0) {
                 fprintf(stderr,
-                        "Invalid OSD source: %s (only 'mock' exists so far)\n",
+                        "Invalid OSD source: %s (use mock or mpu6050)\n",
                         optarg);
                 return EXIT_FAILURE;
             }
@@ -808,21 +812,58 @@ int main(int argc, char **argv)
         struct osd_telemetry_config telemetry_config;
         struct osd_annotate_config annotate_config;
 
-        memset(&osd_config, 0, sizeof(osd_config));
-        osd_config.mode = MOCK_SENSOR_WAVE;
-        if (strcmp(options.osd_mode, "level") == 0) {
-            osd_config.mode = MOCK_SENSOR_LEVEL;
-        } else if (strcmp(options.osd_mode, "ramp") == 0) {
-            osd_config.mode = MOCK_SENSOR_RAMP;
-        }
-        osd_config.amplitude_deg = options.osd_amplitude_deg;
-        osd_config.period_samples = options.osd_period_samples;
+        memset(&osd_source, 0, sizeof(osd_source));
 
-        if (mock_sensor_open(&osd_config, &osd_sensor) == -1) {
-            fprintf(stderr, "Failed to open the mock sensor\n");
-            goto cleanup;
+        if (strcmp(options.osd_source, "mpu6050") == 0) {
+            struct mpu6050_source_config imu_config;
+
+            /*
+             * Bench defaults throughout: header pins 24/14, 100 Hz, 44 Hz
+             * filter, id verified. Nothing about the layout is adjustable from
+             * the command line yet, and adding flags for it would be guessing
+             * at a knob nobody has needed - the pins are soldered once.
+             */
+            memset(&imu_config, 0, sizeof(imu_config));
+
+            if (mpu6050_source_open(&imu_config, &osd_imu) == -1) {
+                fprintf(stderr, "Failed to open the MPU6050 sensor: %s\n",
+                        strerror(errno));
+                goto cleanup;
+            }
+            osd_source = mpu6050_sensor_source(osd_imu);
+
+            /*
+             * Which part this is, printed rather than enforced: the module on
+             * this bench answers 0x70, and a log line saying so is worth more
+             * than a driver that would have refused it.
+             */
+            fprintf(stderr,
+                    "OSD: IMU attached, WHO_AM_I=0x%02X (%s), 100 Hz\n",
+                    (unsigned)mpu6050_source_who_am_i(osd_imu),
+                    mpu6050_who_am_i_name(mpu6050_source_who_am_i(osd_imu))
+                        ? mpu6050_who_am_i_name(
+                              mpu6050_source_who_am_i(osd_imu))
+                        : "unrecognised");
+        } else {
+            struct mock_sensor_config osd_config;
+            struct mock_sensor *osd_sensor = NULL;
+
+            memset(&osd_config, 0, sizeof(osd_config));
+            osd_config.mode = MOCK_SENSOR_WAVE;
+            if (strcmp(options.osd_mode, "level") == 0) {
+                osd_config.mode = MOCK_SENSOR_LEVEL;
+            } else if (strcmp(options.osd_mode, "ramp") == 0) {
+                osd_config.mode = MOCK_SENSOR_RAMP;
+            }
+            osd_config.amplitude_deg = options.osd_amplitude_deg;
+            osd_config.period_samples = options.osd_period_samples;
+
+            if (mock_sensor_open(&osd_config, &osd_sensor) == -1) {
+                fprintf(stderr, "Failed to open the mock sensor\n");
+                goto cleanup;
+            }
+            osd_source = mock_sensor_source(osd_sensor);
         }
-        osd_source = mock_sensor_source(osd_sensor);
 
         if (osd_feed_open(NULL, &osd_source, &feed) == -1) {
             fprintf(stderr, "Failed to open the OSD feed\n");
@@ -1260,9 +1301,15 @@ cleanup:
         telemetry = NULL;
     }
 
-    if (osd_sensor != NULL) {
-        mock_close(osd_sensor);
-        osd_sensor = NULL;
+    /*
+     * Closed through the interface. The mock frees a struct and the IMU
+     * releases two GPIO pins as well - and leaving those exported would stop
+     * the next run from exporting them, which presents as a bus that is dead
+     * for a reason in a process that has already exited.
+     */
+    if (osd_source.close != NULL) {
+        osd_source.close(osd_source.context);
+        osd_source.close = NULL;
     }
 
     if (streaming) {

@@ -45,11 +45,12 @@ MEDIA_SRC := src/mpp_encoder.c src/sink_file.c src/sink_queue.c \
 # give identical output on both sides.
 OSD_SRC := src/osd_font.c src/osd_format.c src/osd_overlay.c \
 	src/osd_telemetry.c src/osd_feed.c src/osd_annotate.c \
-	src/mock_sensor.c src/sensor_attitude.c
+	src/mock_sensor.c src/sensor_attitude.c src/mpu6050_source.c
 
-# Sensor sources are deliberately NOT part of MEDIA_SRC: nothing in the video
-# pipeline references them yet, so adding them here would only enlarge the
-# board binary without changing behaviour.
+# Sensor sources are deliberately NOT part of MEDIA_SRC: the video pipeline
+# itself never references them, and this way the two halves stay separable in a
+# backtrace. The board program links them because the overlay can now be fed
+# from the real IMU, not because the encoder needs them.
 #
 # src/i2c_bitbang.c is host safe: it touches nothing but struct i2c_gpio_ops,
 # which is exactly why the timing can be unit tested with a recording fake.
@@ -69,10 +70,11 @@ v4l2_mpp_encode: src/v4l2_mpp_encode.c src/mpp_encoder.c src/mpp_encoder.h src/v
 	src/h264_util.h src/h264_util.c \
 	src/frame_ring.h src/frame_ring.c src/capture_thread.h src/capture_thread.c \
 	src/osd_annotate.h src/osd_feed.h \
-	src/capture_signal.h
+	src/mpu6050_source.h src/mpu6050_source.c src/mpu6050.h \
+	src/capture_signal.h $(SENSOR_SRC)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Wno-unused-function -Wno-pedantic \
 		$(MPP_CPPFLAGS) $(ROCKIT_CPPFLAGS) $(LDFLAGS) \
-		-o $@ src/v4l2_mpp_encode.c $(MEDIA_SRC) $(OSD_SRC) \
+		-o $@ src/v4l2_mpp_encode.c $(MEDIA_SRC) $(OSD_SRC) $(SENSOR_SRC) \
 		$(MPP_LDFLAGS) $(ROCKIT_LDFLAGS) $(ROCKIT_LDLIBS)
 
 TEST_CFLAGS := -O1 -g -Wall -Wextra -Wpedantic -std=gnu11 -Isrc \
@@ -114,6 +116,18 @@ test-i2c-bitbang: tests/test_i2c_bitbang.c src/i2c_bitbang.c src/i2c_bitbang.h \
 	$(HOSTCC) $(TEST_CFLAGS) -o $@ tests/test_i2c_bitbang.c \
 		src/i2c_bitbang.c src/mpu6050.c -lm
 
+# The real IMU source's conversion half: calibration in, engineering units and
+# an attitude out. Only the half that is not Linux-only is linked, which is the
+# point of the split - the claim this test exists to hold (|a| is 1.000 at rest,
+# not 0.000) is arithmetic and can be checked on every build without a board.
+# The other half, open/read/close over the bit-banged bus, is verified on the
+# bench by scripts/verify-mpu6050.sh.
+test-mpu6050-source: tests/test_mpu6050_source.c src/mpu6050_source.c \
+	src/mpu6050_source.h src/mpu6050.c src/mpu6050.h \
+	src/sensor_attitude.c src/sensor_attitude.h src/sensor_source.h
+	$(HOSTCC) $(TEST_CFLAGS) -o $@ tests/test_mpu6050_source.c \
+		src/mpu6050_source.c src/mpu6050.c src/sensor_attitude.c -lm
+
 # The sensor data plane: source interface, ring, attitude solver, mock source.
 # Nothing here needs Linux or a board, which is the point of the layering - the
 # OSD and alarm logic above this can be built and tested before the hardware is
@@ -154,14 +168,15 @@ test-osd-pipeline: tests/test_osd_pipeline.c src/osd_feed.c src/osd_feed.h \
 		src/osd_overlay.c src/osd_font.c src/osd_format.c
 
 test: test-packet-queue test-rtp-rtsp test-frame-ring test-capture-thread \
-	test-mpu6050 test-i2c-bitbang test-sensor test-osd test-osd-pipeline \
-	board-flags host-syntax-can-fail
+	test-mpu6050 test-i2c-bitbang test-mpu6050-source test-sensor test-osd \
+	test-osd-pipeline board-flags host-syntax-can-fail
 	./test-packet-queue
 	./test-rtp-rtsp
 	./test-frame-ring
 	./test-capture-thread
 	./test-mpu6050
 	./test-i2c-bitbang
+	./test-mpu6050-source
 	./test-sensor
 	./test-osd
 	./test-osd-pipeline
@@ -175,6 +190,17 @@ TOOLS_CPPFLAGS := -Isrc
 mpu6050-probe: tools/mpu6050-probe.c $(SENSOR_SRC) src/mpu6050.h
 	$(CC) $(CPPFLAGS) $(TOOLS_CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ \
 		tools/mpu6050-probe.c $(SENSOR_SRC) $(LDLIBS)
+
+# Board side only. Reads the IMU through the sensor_source interface - the same
+# seam the OSD consumes - and prints the rate, the error count and the at-rest
+# magnitude. The probe above exercises the driver; this exercises the join,
+# which is where a real sensor becomes a sample the overlay can display.
+imu-sample: tools/imu_sample.c $(SENSOR_SRC) src/mpu6050_source.c \
+	src/mpu6050_source.h src/mpu6050.h src/sensor_attitude.c \
+	src/sensor_source.h
+	$(CC) $(CPPFLAGS) $(TOOLS_CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ \
+		tools/imu_sample.c $(SENSOR_SRC) src/mpu6050_source.c \
+		src/sensor_attitude.c $(LDLIBS)
 
 # src/rtsp_server.c is the only file that needs POSIX sockets, which MinGW does
 # not provide. On Windows these targets still catch syntax errors, typos and new
@@ -202,6 +228,9 @@ host-syntax: src/rtsp_server.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/sensor_ring.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/sensor_attitude.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/mock_sensor.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/mpu6050_source.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
+		src/mpu6050_source.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/osd_font.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/osd_overlay.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) src/osd_format.c
@@ -214,6 +243,8 @@ host-syntax: src/rtsp_server.c
 		src/gpio_sysfs.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
 		tools/mpu6050-probe.c
+	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
+		tools/imu_sample.c
 	$(HOSTCC) -fsyntax-only $(TEST_CFLAGS) -Itests/host-stubs -D__linux__ \
 		-include extra.h src/v4l2_mpp_encode.c
 
@@ -249,6 +280,8 @@ host-syntax: src/rtsp_server.c
 board-flags:
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(TOOLS_CPPFLAGS) $(CFLAGS) \
 		-Itests/host-stubs -D__linux__ tools/mpu6050-probe.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(TOOLS_CPPFLAGS) $(CFLAGS) \
+		-Itests/host-stubs -D__linux__ tools/imu_sample.c
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) \
 		-Itests/host-stubs -D__linux__ src/mpu6050_i2c.c
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) \
@@ -258,6 +291,9 @@ board-flags:
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/sensor_ring.c
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/sensor_attitude.c
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/mock_sensor.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/mpu6050_source.c
+	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) \
+		-Itests/host-stubs -D__linux__ src/mpu6050_source.c
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/osd_font.c
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/osd_overlay.c
 	$(HOSTCC) -fsyntax-only $(CPPFLAGS) $(CFLAGS) src/osd_format.c
@@ -300,7 +336,9 @@ host-syntax-can-fail:
 	fi
 
 clean:
-	rm -f v4l2_capture v4l2_mpp_encode mpu6050-probe test-packet-queue \
+	rm -f v4l2_capture v4l2_mpp_encode mpu6050-probe imu-sample \
+		test-packet-queue \
 		test-rtp-rtsp test-frame-ring test-capture-thread test-mpu6050 \
-		test-i2c-bitbang test-sensor test-osd test-osd-pipeline \
+		test-i2c-bitbang test-mpu6050-source test-sensor test-osd \
+		test-osd-pipeline \
 		v4l2_mpp_encode.mutant.c v4l2_mpp_encode.mutant.c.bak
