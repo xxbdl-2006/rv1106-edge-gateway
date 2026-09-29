@@ -358,9 +358,15 @@ run_encoder_with_imu_osd() {
 
     ok "every frame annotated, no refusals, no sensor errors"
 
+    # The program prints "Average FPS  : 21.359", not "21.359 fps". Matching
+    # the wrong form silently reports "not reported" instead of the number
+    # this whole script exists to watch.
     local fps
-    fps="$(grep -oE '[0-9]+\.[0-9]+ fps' "$OSD_LOG" | tail -1)"
-    note "frame rate: ${fps:-not reported} (baseline without the overlay: 30.000 fps)"
+    fps="$(grep -oE 'Average FPS *: *[0-9]+\.[0-9]+' "$OSD_LOG" \
+        | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+    note "frame rate: ${fps:-not reported} fps"
+    note "compare against 30.001 fps for the same encode with no overlay:"
+    note "    $REPO_DIR/scripts/fps-osd-compare.sh"
 }
 
 # --------------------------------------------------------------------------

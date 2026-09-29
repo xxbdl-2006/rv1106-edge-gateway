@@ -96,10 +96,10 @@ struct mpu6050_sensor {
 
     /*
      * Rate limiting. The bus is driven from the same thread that feeds the
-     * encoder, and one bit-banged burst costs a few milliseconds, so the
-     * source will not start a new transaction until this interval has passed.
-     * Reads inside the window return 0 without touching the part: to the feed
-     * that is "no new sample yet", which is exactly what it is.
+     * encoder and one burst costs tens of milliseconds (see the header), so
+     * the source will not start a new transaction until this interval has
+     * passed. Reads inside the window return 0 without touching the part: to
+     * the feed that is "no new sample yet", which is exactly what it is.
      */
     uint64_t min_interval_us;
     uint64_t last_read_us;

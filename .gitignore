@@ -19,6 +19,7 @@
 /test-osd-pipeline
 /test-osd-pipeline.exe
 /mpu6050-probe
+/imu-sample
 *.o
 *.nv12
 *.raw
@@ -40,3 +41,7 @@ datasheets/
 # Working directory of scripts/verify-osd.sh: pulled clips and decoded frames.
 # Kept on failure so the evidence survives, so it must not be committed.
 /.osd-verify/
+
+# Same, for the two newer board scripts.
+/.imu-verify/
+/.fps-compare/

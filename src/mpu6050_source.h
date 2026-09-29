@@ -25,12 +25,15 @@
  *    answer; mpu6050_apply_calibration() checks the same thing from the other
  *    end.
  *
- *  - The polling rate. A bit-banged burst costs a few milliseconds of real
- *    time on this SoC, all of it spent in the thread that also feeds the
- *    encoder, so the source limits how often it will actually touch the bus
- *    and answers "nothing new yet" in between. That is what the interface's
- *    return value of 0 is for: idle is not an error, and only this layer knows
- *    the difference for this device.
+ *  - The polling rate. One 14 byte burst takes about 28 ms of real time on
+ *    this SoC - the sysfs GPIO bus toggles at a few kHz - and all of it is
+ *    spent in the thread that also feeds the encoder. Measured on the board:
+ *    the same 300 frame 720p encode ran at 30.001 fps with no overlay and at
+ *    21.359 fps with this source polled at 100 Hz, dropping 122 frames busy.
+ *    So the source limits how often it will touch the bus and answers
+ *    "nothing new yet" in between. That is what the interface's return value
+ *    of 0 is for: idle is not an error, and only this layer knows the
+ *    difference for this device.
  *
  *  - The error count. Samples climbing while errors stay flat means the part
  *    is quiet; errors climbing means the bus is not working. The OSD prints
@@ -81,7 +84,14 @@ struct mpu6050_source_config {
 };
 
 #define MPU6050_SOURCE_DEFAULT_RATE_DIV 9U      /* 100 Hz */
-#define MPU6050_SOURCE_DEFAULT_MIN_INTERVAL_US 10000ULL
+
+/*
+ * 10 Hz, and deliberately not the 100 Hz the part itself samples at: the limit
+ * is the bus, not the sensor. See the polling rate note at the top of this
+ * file for the measurement that set it. A number drawn on a video frame does
+ * not need to change faster than this anyway.
+ */
+#define MPU6050_SOURCE_DEFAULT_MIN_INTERVAL_US 100000ULL
 
 /*
  * Open the part and wrap it in a source.

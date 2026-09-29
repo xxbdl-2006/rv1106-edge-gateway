@@ -92,6 +92,15 @@ struct encode_options {
     const char *osd_mode;
     float osd_amplitude_deg;
     uint32_t osd_period_samples;
+
+    /*
+     * How often the real IMU may be read, in milliseconds. 0 means "whatever
+     * the source defaults to", which is the normal case. It is a command line
+     * option rather than a constant because the right value is a property of
+     * the bus on the board it is running on, and the only way to find it is to
+     * measure - which needs a way to sweep it without rebuilding.
+     */
+    uint32_t osd_imu_interval_ms;
 };
 
 static void print_usage(const char *program)
@@ -122,6 +131,11 @@ static void print_usage(const char *program)
             "                        (default: %s)\n"
             "      --osd-amplitude D wave amplitude in degrees (default: %u)\n"
             "      --osd-period N    wave period in samples (default: %u)\n"
+            "      --osd-imu-interval-ms N\n"
+            "                        how often the real IMU may be read, 0 for\n"
+            "                        the source default. One bus burst costs\n"
+            "                        tens of milliseconds, so this trades\n"
+            "                        overlay freshness for frame rate.\n"
             "  -q, --quiet           suppress the per frame encoder trace\n"
             "  -h, --help            show this help\n",
             program,
@@ -479,6 +493,7 @@ int main(int argc, char **argv)
     options.osd_mode = ENC_OSD_DEFAULT_MODE;
     options.osd_amplitude_deg = (float)ENC_OSD_DEFAULT_AMPLITUDE;
     options.osd_period_samples = ENC_OSD_DEFAULT_PERIOD;
+    options.osd_imu_interval_ms = 0U;
 
     for (;;) {
         int option;
@@ -502,6 +517,7 @@ int main(int argc, char **argv)
             {"osd-mode", required_argument, NULL, 1007},
             {"osd-amplitude", required_argument, NULL, 1008},
             {"osd-period", required_argument, NULL, 1009},
+            {"osd-imu-interval-ms", required_argument, NULL, 1010},
             {"quiet", no_argument, NULL, 'q'},
             {"help", no_argument, NULL, 'h'},
             {NULL, 0, NULL, 0},
@@ -651,6 +667,20 @@ int main(int argc, char **argv)
                 options.osd_period_samples < 4U) {
                 fprintf(stderr, "Invalid OSD period: %s (at least 4 samples)\n",
                         optarg);
+                return EXIT_FAILURE;
+            }
+            break;
+        case 1010:
+            /*
+             * The upper bound is loose on purpose. A large interval gives a
+             * slow overlay, which is visible and harmless; a small one costs
+             * frame rate, which is neither.
+             */
+            if (parse_u32(optarg, &options.osd_imu_interval_ms) == -1 ||
+                options.osd_imu_interval_ms > 10000U) {
+                fprintf(stderr,
+                        "Invalid OSD IMU interval: %s (0 to 10000 ms, "
+                        "0 means the source default)\n", optarg);
                 return EXIT_FAILURE;
             }
             break;
@@ -825,6 +855,23 @@ int main(int argc, char **argv)
              */
             memset(&imu_config, 0, sizeof(imu_config));
 
+            uint64_t imu_interval_us =
+                (options.osd_imu_interval_ms != 0U)
+                    ? (uint64_t)options.osd_imu_interval_ms * 1000ULL
+                    : (uint64_t)MPU6050_SOURCE_DEFAULT_MIN_INTERVAL_US;
+
+            /*
+             * Left at 0 in the config unless asked, which makes the source
+             * pick its own default. The comment on the option says why it
+             * exists; what matters here is that an unset flag must not
+             * silently pin the interval to something this program knows
+             * nothing about. imu_interval_us keeps the value that will
+             * actually be used, so the log below cannot disagree with it.
+             */
+            if (options.osd_imu_interval_ms != 0U) {
+                imu_config.min_interval_us = imu_interval_us;
+            }
+
             if (mpu6050_source_open(&imu_config, &osd_imu) == -1) {
                 fprintf(stderr, "Failed to open the MPU6050 sensor: %s\n",
                         strerror(errno));
@@ -837,13 +884,21 @@ int main(int argc, char **argv)
              * this bench answers 0x70, and a log line saying so is worth more
              * than a driver that would have refused it.
              */
+            /*
+             * Two different rates, and mixing them up is how the frame rate
+             * cost gets misread: the part samples itself at 100 Hz, but the
+             * bus is only read every imu_interval_us. The second number is
+             * the one that costs frame time.
+             */
             fprintf(stderr,
-                    "OSD: IMU attached, WHO_AM_I=0x%02X (%s), 100 Hz\n",
+                    "OSD: IMU attached, WHO_AM_I=0x%02X (%s), part at 100 Hz, "
+                    "bus read every %llu ms\n",
                     (unsigned)mpu6050_source_who_am_i(osd_imu),
                     mpu6050_who_am_i_name(mpu6050_source_who_am_i(osd_imu))
                         ? mpu6050_who_am_i_name(
                               mpu6050_source_who_am_i(osd_imu))
-                        : "unrecognised");
+                        : "unrecognised",
+                    (unsigned long long)(imu_interval_us / 1000ULL));
         } else {
             struct mock_sensor_config osd_config;
             struct mock_sensor *osd_sensor = NULL;

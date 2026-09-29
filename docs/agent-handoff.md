@@ -111,12 +111,65 @@
 - **量程不可配置**：偏置是**原始计数**，只在 ±2g / ±250dps 下有意义。source 内部固定写
   `MPU6050_CAL_ACCEL_FSR` / `_GYRO_FSR`，`convert()` 还会用传进来的 scale 反查一次。
   静默地在 4g 下减 2g 的偏置会得到 0.98g ——落在所有容差内且是错的。
-- **source 自带限流**（默认 10 ms）：bit-bang 一次突发几毫秒，全花在喂编码器的那个线程上。
+- **source 自带限流**（默认 **100 ms** / 10 Hz）：bit-bang 一次 14 字节突发实测 **约 28 ms**，
+  全花在喂编码器的那个线程上，所以不能每帧都读总线（详见上面「根因」那一节）。
   窗口内的 read 返回 **0（空闲）而不是错误**——接口本来就有这个语义，只有这一层知道区别。
 - **姿态是相对"标定时的安装角"**，不是相对世界水平：单点标定分不清倾斜和零偏，
   X/Y 的偏置里本来就含那 9.3°。要真正分开得做六面翻转，等安装固定了再说。
 
-**还剩：上板验证（30 分钟，唯一阻塞项）**
+**上板结果：PASS，但帧率是真的塌了**（2026-09-29 13:44，`scripts/verify-imu.sh`）
+
+```
+WHO_AM_I=0x70 (MPU6500)      713 samples / 20 s, errors=0
+静止 |a| = 0.990 g            pitch=-0.29 roll=-2.06 temp=47.82 C
+annotated=300 composite_refused=0   sensor polls=300 samples=300 errors=0
+gpio70/71 无残留 export
+Average FPS : 21.359      dropped_busy=122      ← 基线 30.001
+```
+
+数据面、校准、姿态、引脚回收**全部正确**；唯一的问题是帧率。
+
+**根因：bit-bang 总线一次突发约 28 ms，不是"几毫秒"**
+
+实测来源：`imu-sample` 按 10 ms 周期轮询 20 s 只拿到 **713** 个样本（理论 2000），
+即每次循环 ≈ 28 ms。一次 `mpu6050_read()` 就是**单次 14 字节突发**（没有多余事务），
+所以这 28 ms 是总线本身的代价 —— 换算速率约 5 kHz。先前注释里写的"a few milliseconds"
+是错的，已按实测改正。
+
+**对照实验（`scripts/fps-osd-compare.sh`，同场次三种配置各 300 帧）**
+
+| 配置 | fps | dropped_busy |
+|---|---|---|
+| none（无叠加） | 25.000 | 0 |
+| mock | 25.000 | 0 |
+| mpu6050 | 24.427 | 7 |
+
+读法：none→mock 的差是**合成**的成本 = **0**；mock→mpu6050 的差才是 **I²C** 的成本。
+
+**⚠️ 跨场次比 fps 是不可信的**（这次就踩了）：上面这场基线是 25 而不是 30，
+因为脚本刚新起 `rkaiq_3A_server`、曝光还没收敛 → 采集只给 25 fps。
+3A 收敛后采集才回到 30 fps。**必须同场次对照**，这就是这个脚本存在的理由。
+
+两组数据其实自洽，模型如下：
+
+```
+单次 I²C 突发 ≈ 28 ms，编码 ≈ 12 ms，每帧预算 = 1000 / 采集帧率
+  采集 30 fps（33.3 ms 预算）：28+12 = 40 > 33.3  → 崩到 21.4 fps   ✓ 与实测吻合
+  采集 25 fps（40.0 ms 预算）：40 = 40            → 勉强，掉 7 帧    ✓ 与实测吻合
+  改成 100 ms 间隔后 @30fps：每帧只摊 9.3 ms      → 21.3 < 33.3，有余量
+```
+
+**已做的修复**
+
+- `MPU6050_SOURCE_DEFAULT_MIN_INTERVAL_US` 10000 → **100000**（10 Hz）。
+  不是 100 Hz：瓶颈在总线不在传感器。
+- 新增 `--osd-imu-interval-ms N`（0~10000，0 = 用 source 默认）。**这个 flag 必须存在**：
+  正确值是板子上那条总线的属性，只能靠实测找，而找的过程需要能不改代码就扫一遍
+  ——每次回 VM 重编译一趟太贵了。
+- 日志行改成 `part at 100 Hz, bus read every N ms`：把"芯片自采样率"和"总线读取率"
+  分开写，混在一起正是这个成本被读错的原因。
+
+**还剩：重新编译后复验（唯一阻塞项）**
 
 ```bash
 # 1) 在 VM 里（Windows 没有 ARM 工具链，进不去 VM，只能手动）
@@ -124,17 +177,14 @@ cd /mnt/hgfs/luckfox_share/rv1103
 make clean && make CROSS_COMPILE=arm-rockchip830-linux-uclibcgnueabihf-
 make CROSS_COMPILE=arm-rockchip830-linux-uclibcgnueabihf- imu-sample
 # 2) 回 Windows
-bash scripts/verify-imu.sh
+bash scripts/verify-imu.sh          # 看 fps 是否回到 30
+bash scripts/fps-osd-compare.sh     # 同场次对照
 ```
 
-**验收判据**（脚本已自动判）：WHO_AM_I 有值（本板 0x70）；samples 连续、errors=0；
-静止 `|a| = 1.000 ± 0.02`（**不是 0.000**，不是 1.062）；`annotated=300 composite_refused=0`；
-跑完 `gpio70/71` 无残留 export；fps 不塌（基线 30.000）。
+复验时顺便扫一遍间隔确认拐点（一次编译即可，靠 flag）：
+`--osd-imu-interval-ms 10 / 50 / 100 / 200`。
 
-**已知风险**：OSD 轮询 50 Hz × 每次 I²C 突发几毫秒，可能吃掉喂帧线程的预算。
-上板第一次跑要看 fps 那一行；若塌了，把 `MPU6050_SOURCE_DEFAULT_MIN_INTERVAL_US`
-从 10000 调大（20~50 ms 对显示完全够），或把采样挪到独立线程。**不要**在没测 fps 的情况下
-直接把 `--osd-source mpu6050` 写进 `/userdata/gateway.env`。
+**在拿到 30 fps 的复验结果前，不要把 `--osd-source mpu6050` 写进 `/userdata/gateway.env`。**
 
 ### P1 — 决策：OSD 是否并入默认生产配置
 
