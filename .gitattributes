@@ -14,6 +14,13 @@ scripts/S99gateway text eol=lf
 scripts/gateway-supervise.sh text eol=lf
 scripts/soak-monitor.sh text eol=lf
 
+# The production command line. Sourced by a shell in two places - on the board
+# once install_autostart.ps1 has pushed it, and in place by the soak scripts -
+# and in both a CR at the end of GATEWAY_ARGS is parsed as part of the last
+# argument. Same failure as the shebang above, harder to see: the gateway comes
+# up with one nonsense option instead of not coming up at all.
+scripts/gateway.env text eol=lf
+
 *.ps1 text eol=crlf
 
 # cmd.exe batch files. CRLF is not optional here in the way it is for .sh: the

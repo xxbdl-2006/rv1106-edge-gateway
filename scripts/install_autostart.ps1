@@ -138,19 +138,55 @@ foreach ($remote in @($SupervisorPath)) {
 Write-Host "    ok"
 
 Step "writing $EnvPath"
-$quiet = ""
+#
+# The arguments live in scripts/gateway.env, not in this script. Generating
+# them inline meant every reinstall reset whatever had been tuned on the
+# board -- the overlay added on 2026-09-29 would have survived exactly until
+# the next install -- and there was nowhere to record why a flag is set. The
+# repository version is the one people edit.
+#
+$EnvLocal = Join-Path $ScriptsDir "gateway.env"
+if (-not (Test-Path $EnvLocal)) {
+    throw "missing $EnvLocal"
+}
+$envLines = Get-Content -Path $EnvLocal
+
+#
+# The one thing still computed here is whether this particular binary
+# understands --quiet: an older build handed an unknown option refuses to
+# start, and that is worse than a wordy log. The flag is dropped only from the
+# arguments line, so the comments explaining the rest survive untouched.
+#
 $help = Board -Command "/userdata/v4l2_mpp_encode --help 2>&1" -AllowFailure
 if ($help -match "--quiet") {
-    $quiet = " --quiet"
     Write-Host "    the binary supports --quiet, per frame trace stays off"
 } else {
-    Write-Host "    the binary does not support --quiet yet, log will be wordy"
+    Write-Host "    the binary does not support --quiet yet; dropping it from GATEWAY_ARGS"
+    $envLines = $envLines | ForEach-Object {
+        if ($_ -like "GATEWAY_ARGS=*") { $_ -replace "--quiet\s*", "" } else { $_ }
+    }
 }
 
-$arguments = "-d /dev/video11 -w 1280 -H 720 --warmup 30 --sink rtsp --rtsp-port 8554" + $quiet
-$envContent = "# Change the gateway arguments here, then: $InitPath restart`nGATEWAY_ARGS=`"$arguments`"`n"
-$envContent | Out-File -FilePath (Join-Path $env:TEMP "gateway.env") -Encoding ascii
-Push-And-Check -LocalPath (Join-Path $env:TEMP "gateway.env") -RemotePath $EnvPath
+#
+# Written with LF deliberately. This file is sourced by the shell on the board,
+# so a CR at the end of GATEWAY_ARGS would be parsed as part of the last
+# argument. Out-File would use whatever line ending this platform prefers.
+#
+$envText = ($envLines -join "`n") + "`n"
+$EnvStaging = Join-Path $env:TEMP "gateway.env"
+[System.IO.File]::WriteAllText($EnvStaging, $envText, (New-Object System.Text.UTF8Encoding($false)))
+Push-And-Check -LocalPath $EnvStaging -RemotePath $EnvPath
+
+#
+# The supervisor gets a syntax check above, and this file is sourced by it, so
+# a broken line here would otherwise surface much later as a gateway running
+# with no arguments at all. People edit this one by hand.
+#
+$syntax = Board -Command "sh -n $EnvPath" -AllowFailure
+if ($syntax) {
+    throw "sh -n reported a problem in ${EnvPath}:`n$syntax"
+}
+Write-Host "    ok"
 
 #
 # /etc/inittab already remounts / read write at sysinit, so this is normally a

@@ -52,11 +52,10 @@ ADB_WAIT_S="${ADB_WAIT_S:-150}"
 # converged, so this is the duration expressed in the unit the program uses.
 FRAMES="${FRAMES:-$((DURATION_MIN * 60 * 30))}"
 
-# The production command line from /userdata/gateway.env, with the overlay added.
-# Soaked as it would ship rather than as something invented here: a soak of a
+# The command line comes from scripts/gateway.env below - the same file
+# install_autostart.ps1 puts on the board, so what gets soaked is what ships.
+# Soaked as it would run rather than as something invented here: a soak of a
 # different configuration proves something about a configuration nobody runs.
-PROD_ARGS="-d /dev/video11 -w 1280 -H 720 --warmup 30 --sink rtsp --rtsp-port 8554 --threads --ring-slots 4 --quiet"
-OSD_ARGS="--osd --osd-source mpu6050"
 
 SOAK_LOG="$BOARD_DIR/imu-soak.log"
 SOAK_CSV="$BOARD_DIR/soak.csv"
@@ -67,6 +66,29 @@ SOAK_CSV="$BOARD_DIR/soak.csv"
 # converted explicitly, while every path that names a file on the board must
 # not be. Getting this backwards is not a crash: adb reports "No such file or
 # directory" for a file that is plainly there.
+# The command line comes from scripts/gateway.env, which is the same file
+# install_autostart.ps1 puts on the board. Soaking anything else proves
+# something about a configuration nobody runs - and worse, it silently stops
+# being reproducible once someone edits the real one.
+#
+# Read after the helpers above: this wants to die if the file is missing.
+GATEWAY_ENV="$REPO_DIR/scripts/gateway.env"
+[ -f "$GATEWAY_ENV" ] || die "missing $GATEWAY_ENV; it defines what gets soaked"
+# shellcheck source=/dev/null
+. "$GATEWAY_ENV"
+PROD_ARGS="${GATEWAY_ARGS:-}"
+[ -n "$PROD_ARGS" ] || die "$GATEWAY_ENV sets no GATEWAY_ARGS"
+case " $PROD_ARGS " in
+    *" --sink rtsp "*) ;;
+    *) die "this soaks the production line, so it needs --sink rtsp in $GATEWAY_ENV" ;;
+esac
+#
+# Whatever is configured gets soaked, overlay included, so there is nothing to
+# add here. Set EXTRA_ARGS to try a variant of the production line rather than
+# a different line, which keeps the comparison honest and the commands short.
+#
+PROD_ARGS="${PROD_ARGS}${EXTRA_ARGS:+ $EXTRA_ARGS}"
+
 to_native_path() {
     if command -v cygpath >/dev/null 2>&1; then
         cygpath -m "$1"
@@ -238,7 +260,7 @@ main() {
     sleep 1
 
     adb_sh ". /etc/profile.d/RkEnv.sh >/dev/null 2>&1; cd $BOARD_DIR && \
-            setsid ./$BINARY $PROD_ARGS $OSD_ARGS --frames $FRAMES \
+            setsid ./$BINARY $PROD_ARGS --frames $FRAMES \
                 >$SOAK_LOG 2>&1 </dev/null & \
             sleep 2; echo encoder started" >/dev/null
     sleep 5

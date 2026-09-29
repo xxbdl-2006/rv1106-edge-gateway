@@ -31,6 +31,19 @@ while [ $# -gt 0 ]; do
 done
 
 SECONDS_TO_RUN=$((HOURS * 3600))
+
+#
+# The arguments come from scripts/gateway.env, the same file
+# install_autostart.ps1 installs. Writing them inline here used to quietly
+# reset whatever the board was actually running - a run started this way would
+# have dropped the overlay added on 2026-09-29 - and left no single place to
+# change the production command line.
+#
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$SCRIPT_DIR/gateway.env" ] || { echo "missing $SCRIPT_DIR/gateway.env" >&2; exit 1; }
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/gateway.env"
+GATEWAY_ARGS="${GATEWAY_ARGS}${GATEWAY_EXTRA:+ $GATEWAY_EXTRA}"
 STAMP=$(date +%Y%m%d-%H%M%S)
 OUT_DIR="D:/luckfox_share"
 LOG="$OUT_DIR/soak-${HOURS}h-$STAMP.log"
@@ -62,7 +75,8 @@ adb devices | grep "device$"
 
 echo
 echo "=== 1. 写入运行参数并重启网关 ==="
-GATEWAY_ARGS="-d /dev/video11 -w 1280 -H 720 --warmup 30 --sink rtsp --rtsp-port 8554 --quiet${GATEWAY_EXTRA}"
+# GATEWAY_ARGS comes from scripts/gateway.env above, so this writes the same
+# line the installer would rather than one invented here.
 adb_sh "echo 'GATEWAY_ARGS=\"$GATEWAY_ARGS\"' > /userdata/gateway.env"
 adb_sh "cat /userdata/gateway.env"
 

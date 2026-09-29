@@ -77,10 +77,17 @@
 - **上板实测结果**：`--osd` 跑 300 帧 → `annotated=300 passed_through=0 composite_refused=0`，sensor `polls=300 samples=300`，**30.003 fps vs 无 OSD 30.000 fps（零可测开销）**；像素判定 overlay 区 21.0% 像素变化 >40 灰阶、对照带 0.0%；裁剪图肉眼可见面板。
 - 一键验证脚本存在且已跑通：`scripts/verify-osd.sh`（Windows 入口 `scripts/verify-osd.cmd`）。
 
-✅ **生产配置已开 OSD（2026-09-29 15:2x）**：板端 `/userdata/gateway.env` 现为
-`GATEWAY_ARGS="... --threads --ring-slots 4 --quiet --osd --osd-source mpu6050"`
-—— 真实 IMU 数据烧进直播流。原文件备份在 `/userdata/gateway.env.bak`（120 字节），
-**回滚 = `cp /userdata/gateway.env.bak /userdata/gateway.env` 后 `/etc/init.d/S99gateway restart`**。
+✅ **生产配置已开 OSD（2026-09-29 15:2x）**：`GATEWAY_ARGS="... --threads --ring-slots 4
+--quiet --osd --osd-source mpu6050"` —— 真实 IMU 数据烧进直播流。
+
+🔴 **生产命令行的唯一来源是仓库里的 `scripts/gateway.env`**，由 `scripts/install_autostart.ps1`
+推成板上的 `/userdata/gateway.env`。**不要直接在板上改** —— 下一次重装会静默覆盖它
+（这一点原来是错的：安装脚本把参数写死在自己内部，所以重装一次叠加层就没了，
+而且没有任何地方记录生产命令行长什么样）。改配置 = 改 `scripts/gateway.env` 再重装。
+而 `imu-soak.sh` / `start-2h-soak.sh` 现在也从同一个文件读参数，避免三处各写一份。
+
+回滚：`adb shell "cp /userdata/gateway.env.bak /userdata/gateway.env"` 后 `S99gateway restart`
+（那个备份是本轮之前的无 OSD 配置，仍有效）。
 
 **已经在真实流上确认过**（不只是编码计数器）：从 Windows 侧 `ffmpeg -rtsp_transport tcp -i
 rtsp://172.32.0.93:8554/live/0` 抽两帧 PNG，肉眼可见面板，且**两帧之间数值在变**
@@ -294,8 +301,19 @@ bash scripts/verify-mpu6050.sh            # 第 1 步（找工具链）只能在
 # 真实 IMU 源一键验证（Windows；二进制需先在 VM 编好）
 bash scripts/verify-imu.sh
 
+# 部署生产配置（开机三件套 S99gateway / gateway-supervise.sh / gateway.env）
+powershell -File scripts/install_autostart.ps1          # 只装，不碰正在跑的进程
+powershell -File scripts/install_autostart.ps1 -Start   # 装完立刻起
+adb shell "/etc/init.d/S99gateway restart"              # 让新的 GATEWAY_ARGS 生效
+
+# 🔴 生产命令行的唯一来源 = scripts/gateway.env（仓库里）。
+#    改配置改这里再重装，不要在板上改 —— 板上那份是它的副本。
+
 # 网关状态（判活用进程名 v4l2_mpp_encode，不是 gateway）
 adb shell "pidof v4l2_mpp_encode; pidof gateway-supervise.sh; pidof rkaiq_3A_server"
+
+# 从另一端真拉流抽帧（判「叠加层真的到了客户端」的唯一方法）
+ffmpeg -rtsp_transport tcp -i rtsp://172.32.0.93:8554/live/0 -t 8 -frames:v 2 out-%02d.png
 ```
 
 ---
@@ -365,6 +383,19 @@ adb shell "pidof v4l2_mpp_encode; pidof gateway-supervise.sh; pidof rkaiq_3A_ser
 - **产物目录一直保留，下一轮开始时清**（trap 在成功时删产物 = 丢唯一证据）。
 - 大段跳读别用 `dd bs=1`（逐字节 3 分钟+），用整行块 `bs=w skip=y count=rh`（1.35s）。
 - 跑长脚本前**冻结文件**，中途编辑会撞上 bash 读到改了一半的文件 → 报莫名其妙的语法错误。
+
+### 7.5 同一份配置写在多处 → 重装会静默回退
+
+2026-09-29 的实例：生产的 `GATEWAY_ARGS` 曾同时存在于四个地方 —— `install_autostart.ps1`
+（在内部拼字符串生成）、`start-2h-soak.sh`、`imu-soak.sh`、以及板上的 `/userdata/gateway.env`。
+把叠加层加进板上那份之后，**任何一次重装或长稳都会把它抹掉**，而且全程没有任何报错：
+现象是「OSD 某天开始不见了」，排查方向会指向 OSD 代码，而原因在一个安装脚本里。
+
+现在唯一来源是 `scripts/gateway.env`：安装脚本推它，两个长稳脚本 source 它。
+安装脚本里唯一还自己算的是 `--quiet` 的能力检测（老二进制给了这个 flag 会拒绝启动），
+且明确只改 `GATEWAY_ARGS=` 那一行，不动解释性注释。
+
+**判据**：如果一件事「改了 A 之后 B 会把它改回去」，那 A 不是配置，是**副本**。
 
 ---
 
