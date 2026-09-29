@@ -22,7 +22,13 @@ SC3336 -> MIPI CSI -> V4L2 -> NV12 -> MPP H.264 -> Packet Queue -> RTSP
 - Packet Sink 抽象 + File Sink + 有界 Packet Queue（满时丢最旧整个 GOP）。
 - **RTSP over TCP 多客户端**，ffplay / VLC / ffmpeg 均可播放，已上板验证。
 - **开机自启**：重启后约 11 秒自动出流，无需人工操作。
-- **Frame RingBuffer + 采集线程独立**（`--threads`），已主机自测。
+- **Frame RingBuffer + 采集线程独立**（`--threads`），已上板验证并跑满 8 小时。
+- **Sensor 数据面**：`sensor_source` 接口 + 有界环形缓冲 + 姿态解算 + Mock 数据源。
+- **MPU6050 驱动**：位翻转 I2C 已上真硅片读通（`WHO_AM_I=0x70`，0 io error），**但未接入数据面**。
+- **OSD 叠加**：已接进编码流水线并上板验证 PASS（300/300 帧合成成功，帧率零开销）。
+  注意：当前 `/userdata/gateway.env` **没有** `--osd`，直播流默认是干净画面。
+
+> 全局最新的完成/未完成清单见 **`docs/agent-handoff.md`**；本文件的这部分不再维护。
 
 ```text
 rtsp://172.32.0.93:8554/live/0
@@ -37,7 +43,7 @@ rtsp://172.32.0.93:8554/live/0
 ```
 
 采集与编码默认仍是同步流水线；加 `--threads` 后采集线程独立、经 Frame RingBuffer 交给编码。
-尚未实现 OSD 和 MPU6050。
+加 `--osd` 后传感器遥测会被合成进每一帧；当前只支持 `--osd-source mock`，真实 MPU6050 尚未接入。
 
 详细的验收数据、已修复缺陷根因和构建自测说明见 `docs/status.md`。
 
@@ -435,11 +441,17 @@ VLC / ffplay 可以打开 rtsp://172.32.0.93:8554/live/0
 ```text
 [x] Packet Sink / File Sink / Packet Queue
 [x] RTSP over TCP 多客户端
-[x] Frame RingBuffer + 采集线程独立（待上板验证）
+[x] Frame RingBuffer + 采集线程独立（8 小时长稳通过）
 [x] 开机服务
-[ ] 8 小时长稳正式验收
-[ ] Mock Sensor -> OSD 数据面
-[ ] 真实 MPU6050 接入
+[x] 8 小时长稳正式验收（864,001 帧零丢帧零泄漏）
+[x] Mock Sensor -> OSD 数据面
+[x] OSD 接进编码流水线并上板验证
+[ ] 真实 MPU6050 接入（缺 src/mpu6050_source.c）
+[ ] OSD 并入默认生产配置（gateway.env 尚未加 --osd）
+[ ] 网络断开/恢复专项测试
+[ ] 架构图与演示视频
+
+更新版本的清单（含每项证据）见 `docs/agent-handoff.md`。
 ```
 
 ## 安全与资源注意事项
