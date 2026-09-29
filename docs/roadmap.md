@@ -11,7 +11,7 @@
 > | 多线程与 RingBuffer | ✅ `--threads` + frame_ring |
 > | 传感器阶段 | ✅ Mock + 真实 MPU6500（走 bit-bang，非 `/dev/i2c-4`） |
 > | OSD 与告警阶段 | ⚠️ OSD ✅（未用 RGA/MPP OSD，走 1bpp 画布自合成）；**告警通道未实现** |
-> | 系统服务阶段 | ✅ 开机 11 秒出流 |
+> | 系统服务阶段 | ✅ 上电到出流约 19 秒（旧记录「11 秒」已作废，见 status.md §2.8） |
 > | 工程化与压力测试 | ⚠️ 8h/多客户端/泄漏/CPU 温度 ✅；**网络断线恢复、端到端延迟未测** |
 > | 最终交付物 | ⚠️ 代码与脚本 ✅；**架构图、演示视频未产出** |
 
@@ -174,7 +174,7 @@ freetype/fontconfig 的精简 rootfs）。结果见 `docs/status.md` §1.3：300
 5. 实现异常重启。
 6. 增加日志和运行统计。
 
-**实测**：`adb reboot` 后 **11 秒自动出流**。接管判据是**等 `/dev/video11` 节点出现**
+**实测**：**冷启动上电到出流约 19 秒**。接管判据是**等 `/dev/video11` 节点出现**
 （不是等 rkipc 进程 —— rkipc 只在开机启动一次，restart 时永远不会出现，旧写法白等 20 秒）。
 三件套：`S99gateway` + `/userdata/gateway-supervise.sh` + `/userdata/gateway.env`。
 

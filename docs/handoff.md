@@ -72,7 +72,7 @@ MPU6050 -> bit-bang I²C (gpio70/71) -> Sensor RingBuffer -> OSD
 | Packet Sink/Queue | 已完成 | File Sink、Queue Sink、有界丢帧队列 |
 | RTSP over TCP | 已完成 | 多客户端 fan-out，已上板验证 |
 | Frame RingBuffer | 已完成 | `--threads` 采集线程独立，**已上板验证**（8 小时长稳走的即此路径） |
-| 开机自启 | 已完成 | `adb reboot` 后 11 秒自动出流，已二次重启验证 |
+| 开机自启 | 已完成 | 冷启动实测：**上电到出流约 19 秒**（2026-09-29 修复竞态后；旧记录的「11 秒」已作废，见 §13） |
 | 长稳测试 | 已完成 | **8 小时干净收尾**：864,001 帧 / 30.00fps / 零丢帧零泄漏（2026-09-28） |
 | Sensor 数据面 | 已完成 | `sensor_source` 接口 + 有界样本环 + 姿态解算 + Mock 源（`test-sensor`） |
 | MPU6050 驱动 | 已完成 | 软件 bit-bang I²C 读通真硅片：`WHO_AM_I=0x70`(MPU6500)、0 io error、静止 `\|a\|≈0.99g` |
@@ -456,9 +456,10 @@ MppCtxType error 0
 
 **功能性缺口**
 
-- **冷启动只验证了一半**：验证「上电 → 3A 首次收敛」时 `rkaiq_3A_server` 已在运行，
-  没经历完整冷启动。fail-soft 已就位（那一刻 IMU 若没就绪 → 少叠加层而不是没有流），
-  下次自然断电重启后 `grep -E 'IMU attached|IMU unavailable' /userdata/gateway.log` 确认即可。
+- ✅ **冷启动已补完验证，并发现另一半是坏的**：2026-09-29 补做「上电 → 3A 首次收敛」，
+  结果**每次上电都不出流** —— 接管逻辑与 `RkLunch.sh` 后台启动 rkipc 的竞态。
+  已用 `/proc/uptime` 做开机/重启判别修复并复验 PASS。详见 `docs/status.md` §2.8。
+  **「开机 11 秒出流」这个旧数字随之作废，正确值是上电到出流约 19 秒。**
 - **网络断开/恢复专项测试从未跑过**（roadmap 列了，没做）。
 - **端到端延迟没有正式测量**：只有 ffplay 约 0.75s 的粗测，无文档化方法。
 - **架构图与演示视频未产出**。
@@ -492,17 +493,18 @@ MppCtxType error 0
 | 7 | Frame RingBuffer + 编码线程 | ✅ **已上板验证**（8 小时长稳走此路径） |
 | 8 | Mock Sensor + OSD 数据面 | ✅ 已完成，`test-sensor` / `test-osd` / `test-osd-pipeline` 覆盖 |
 | 9 | 接入真实 MPU6050 | ✅ **已进生产配置**（`--osd-source mpu6050`，真实数据已从 RTSP 抽帧确认在变） |
-| 10 | 开机服务 + 8 小时稳定性测试 | ✅ 开机 11 秒出流；**8 小时干净收尾**（864,001 帧 / 零丢帧 / 零泄漏） |
+| 10 | 开机服务 + 8 小时稳定性测试 | ✅ 上电到出流约 19 秒（竞态已修，见 §13）；**8 小时干净收尾**（864,001 帧 / 零丢帧 / 零泄漏） |
 
 **剩下的是 P2 工程化收尾**（都是文档与素材，不是功能）：
 
 ```text
 [x] README.md / docs/handoff.md 过时表述（2026-09-29 已全量对齐现状）
-[x] docs/status.md 补 OSD 上板与真实 IMU 章节（已补，含 bit-bang 根因与配置副本两条）
+[x] docs/status.md 补 OSD 上板与真实 IMU 章节（另补 §2.6/§2.7/§2.8 三条根因）
+[x] 冷启动（上电 → 3A 首次收敛）完整验证 —— 已做，并发现+修复严重缺陷（§2.8）
 [ ] 网络断开/恢复专项测试
 [ ] 端到端延迟的正式测量
 [ ] 架构图、演示视频
-[ ] 冷启动（上电 → 3A 首次收敛）的完整验证
+[ ] restart 端到端回归（被 USB 掉链打断）
 ```
 
 已完成项的实测数据和根因分析见：
@@ -616,6 +618,7 @@ python .\tools\nv12_to_png.py frame.nv12 frame.png --width 1280 --height 720
 [x] RTSP 标准输出               rtsp://172.32.0.93:8554/live/0，多客户端 fan-out
 [x] 多线程 RingBuffer           --threads + frame_ring，8 小时长稳零丢帧
 [x] 传感器和 OSD                真实 MPU6500 → 姿态 → OSD 叠加，已进生产配置
+[x] 冷启动可靠出流              上电→出流约 19 秒（2026-09-29 修的竞态；旧记录「11 秒」已作废）
 [~] 异常恢复                    fail-soft（缺 IMU 不掉流）已就位；
                                 网络断开/恢复专项测试仍未跑
 [x] 长时间运行测试              8 小时 864,001 帧；30 分钟带 IMU 长稳

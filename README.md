@@ -21,7 +21,7 @@ SC3336 -> MIPI CSI -> V4L2 -> NV12 -> MPP H.264 -> Packet Queue -> RTSP
 - NV12 数据送入 Rockit MPI 硬件编码 H.264，文件可由 VLC 正常播放。
 - Packet Sink 抽象 + File Sink + 有界 Packet Queue（满时丢最旧整个 GOP）。
 - **RTSP over TCP 多客户端**，ffplay / VLC / ffmpeg 均可播放，已上板验证。
-- **开机自启**：重启后约 11 秒自动出流，无需人工操作。
+- **开机自启**：冷启动实测**上电到出流约 19 秒**，无需人工操作。
 - **Frame RingBuffer + 采集线程独立**（`--threads`），已上板验证并跑满 8 小时。
 - **Sensor 数据面**：`sensor_source` 接口 + 有界环形缓冲 + 姿态解算 + Mock 数据源。
 - **MPU6050 驱动**：位翻转 I2C 已上真硅片读通（`WHO_AM_I=0x70`，0 io error）；
@@ -390,7 +390,11 @@ adb shell "/userdata/v4l2_mpp_encode -d /dev/video11 -w 1280 -H 720 --warmup 30 
 
 ### 开机自启
 
-`scripts/install_autostart.ps1` 一键安装；重启后无需人工干预，约 11 秒自动出流。
+`scripts/install_autostart.ps1` 一键安装；重启后无需人工干预，**上电到出流约 19 秒**。
+
+> 🔴 早先文档里的「11 秒」已作废：它测的是**不可靠的路径**。2026-09-29 补做真正的冷启动
+> 验证时发现，接管逻辑与厂商 `RkLunch.sh` 后台启动 rkipc 存在竞态 —— **每次上电都不出流**。
+> 已修（用 `/proc/uptime` 区分开机与重启），详见 `docs/status.md` §2.8。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install_autostart.ps1 -Start

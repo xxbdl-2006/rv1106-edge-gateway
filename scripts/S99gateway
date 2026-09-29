@@ -73,6 +73,16 @@ CAPTURE_DEVICE="/dev/video11"
 PIDFILE="/tmp/gateway-supervisor.pid"
 THREE_A_LOG="/tmp/rkaiq-3a.log"
 
+# Uptime, in seconds, below which a missing rkipc is still expected to turn up.
+#
+# On a cold boot this script runs at about six seconds while rkipc appears at
+# about seven and a half, so at boot the two are never in the order the code
+# below would like. See wait_for_late_rkipc for why that gap exists.
+#
+# Past this uptime the vendor chain has had ample time, so an absent rkipc
+# really does mean this is a restart and nothing is coming.
+VENDOR_CHAIN_GRACE_SECONDS=30
+
 # Boot time is exactly when things go wrong and exactly when nobody is watching
 # the console. Everything is mirrored into a file on tmpfs, which survives long
 # enough to be read after the board comes up.
@@ -108,6 +118,72 @@ wait_for_rkipc_streaming() {
     waited=0
     while [ "$waited" -lt 300 ]; do
         rkipc_is_streaming && return 0
+        waited=$((waited + 1))
+        sleep 0.1
+    done
+    return 1
+}
+
+# Seconds since boot. There is no stat(1) on this board, so /proc/uptime is the
+# only clock that is both monotonic and free of the RTC's idea of the date.
+uptime_seconds() {
+    _uptime=$(cat /proc/uptime 2>/dev/null)
+    _secs="${_uptime%%.*}"
+    case "$_secs" in
+        ''|*[!0-9]*) echo 0 ;;
+        *) echo "$_secs" ;;
+    esac
+}
+
+# Is the vendor startup chain still around?
+#
+# Used only as an early way out while waiting for rkipc, never as the primary
+# signal. Its absence is meaningful; its presence is not. On this board a
+# process running RkLunch.sh was found still alive minutes after boot, with no
+# children, sitting in do_wait — so "the chain is up" cannot be read as "the
+# chain has not started rkipc yet".
+vendor_chain_running() {
+    for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        _chain_cmd=$( { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null )
+        case "$_chain_cmd" in
+            *RkLunch.sh*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Wait for rkipc to turn up, with three different ways to stop waiting.
+#
+# Only called when rkipc is currently absent — which used to be read as
+# "nothing is coming". That reading is wrong on a cold boot, and it is the
+# bug this function exists to fix:
+#
+#   RkLunch.sh ends with `post_chk &`. rkipc is the *last* thing that
+#   backgrounded function does, and post_chk gets there only after waiting on
+#   /userdata, installing kernel modules, setting up the network, a speaker
+#   test and a luckfox-config call. Measured on this board: post_chk reaches
+#   its rkipc line about 7.5 s after boot, while S99gateway runs at about 6 s.
+#   The old code therefore looked in the gap, concluded there was nothing to
+#   wait for, let the kill step find an empty pid list, and then watched rkipc
+#   arrive and take the capture node. It gave up with
+#   "rkipc survived as [N], the capture node stays busy" and the board came up
+#   with rkipc streaming and no gateway at all.
+#
+# A restart is the opposite case: the chain ran once at boot and will never run
+# again, so no rkipc is ever coming and waiting would just delay every restart
+# — which is the bug the *previous* rewrite fixed. Uptime is what tells the two
+# apart; it is the one piece of information the old code did not have.
+#
+# The three exits, in the order they normally fire:
+#   rkipc appeared      - what a cold boot looks like when it works
+#   the chain is gone   - it finished without starting rkipc; nothing to wait for
+#   uptime past grace   - too late for boot, so this must be a restart
+wait_for_late_rkipc() {
+    waited=0
+    while [ "$waited" -lt 300 ]; do
+        pidof rkipc >/dev/null 2>&1 && return 0
+        [ "$(uptime_seconds)" -ge "$VENDOR_CHAIN_GRACE_SECONDS" ] && return 1
+        vendor_chain_running || return 1
         waited=$((waited + 1))
         sleep 0.1
     done
@@ -155,11 +231,12 @@ wait_for_capture_node() {
 #                       it touches the camera, and taking the node during that
 #                       window leaves the ISP half configured.
 #
-#   rkipc is absent   - either this is a restart, or the vendor startup chain
-#                       has not reached its rkipc line yet. In both cases
-#                       there is nothing to wait for. This is the case the
-#                       old code got wrong: it waited the full 20s every time
-#                       because it assumed rkipc was on its way.
+#   rkipc is absent   - this now has two sub-cases and they must not be
+#                       conflated. On a restart the chain is long finished and
+#                       nothing is coming, so waiting is pure delay. On a cold
+#                       boot the chain is mid-flight and rkipc is seconds away,
+#                       so not waiting loses the camera entirely. Uptime is
+#                       what separates them; see wait_for_late_rkipc.
 #
 # The pre-existing-holder case is handled by the caller, which must not take
 # the camera from a running gateway.
@@ -170,8 +247,12 @@ camera_takeover_wait() {
     fi
 
     if ! pidof rkipc >/dev/null 2>&1; then
-        boot_log "no rkipc, nothing is initialising the camera, proceeding"
-        return 0
+        if wait_for_late_rkipc; then
+            boot_log "rkipc appeared late (uptime $(uptime_seconds)s), it was on its way after all"
+        else
+            boot_log "no rkipc, nothing is initialising the camera, proceeding"
+            return 0
+        fi
     fi
 
     boot_log "rkipc is present, waiting for it to open $CAPTURE_DEVICE"
@@ -288,14 +369,35 @@ takeover_task() {
     fi
 
     stop_by_name rkipc
-    sleep 2
+
+    # kill -9 is asynchronous, and rkipc holds the capture node while it exits,
+    # so wait for both the process and the node to come free instead of
+    # assuming a fixed two seconds covers it.
+    waited=0
+    while [ "$waited" -lt 50 ]; do
+        if ! pidof rkipc >/dev/null 2>&1 && [ -z "$(capture_holder)" ]; then
+            break
+        fi
+        waited=$((waited + 1))
+        sleep 0.1
+    done
 
     remaining=$(pidof rkipc)
     if [ -n "$remaining" ]; then
         boot_log "rkipc survived as [$remaining], the capture node stays busy"
         return 1
     fi
-    boot_log "rkipc is gone"
+
+    # Nobody should have the node now. If somebody does, it is not rkipc and
+    # starting the gateway on top of it would produce the same "device busy"
+    # failure we just spent this effort avoiding.
+    holder=$(capture_holder)
+    if [ -n "$holder" ]; then
+        boot_log "$CAPTURE_DEVICE is still held by $holder after rkipc exited"
+        return 1
+    fi
+
+    boot_log "rkipc is gone, $CAPTURE_DEVICE is free"
 
     boot_log "starting the 3A server"
     attempt=0

@@ -10,6 +10,9 @@
 > - **§1.4 真实 MPU6500 进生产配置** —— 30 分钟 54000 帧 30.000 fps，真拉流抽帧确认数值在动。
 > - **§2.6 bit-bang 总线成本**（新根因）—— 一次 14 字节突发 **28 ms** 而非「几毫秒」，
 >   以及由此选出的 100 ms 轮询间隔。
+> - **§2.7 配置写在多处 = 副本**（新根因）—— 重装会静默抹掉板上改动。
+> - **§2.8 冷启动从未成功过**（**最严重**）—— 接管逻辑与厂商启动链的竞态，
+>   每次上电都不出流；已修复并复验通过。**同时作废「开机 11 秒出流」这个数字。**
 > - §4 测试套件表、§5 板端操作、§6 下一步同步更新。
 
 ---
@@ -24,7 +27,8 @@
 | 客户端重连可恢复 | 必须 | 重连后从下一个 IDR 开始 | 通过 |
 | 30 分钟播放不崩溃 | 必须 | 54004 帧 / 0 empty | 通过 |
 | 多客户端 | 加分项 | 4 路并发，关任一路不影响其他 | 通过 |
-| 开机自启 | 加分项 | `adb reboot` 后 11 秒自动出流 | 通过 |
+| 开机自启 | 加分项 | 冷启动实测：**上电到出流约 19 秒**（修复竞态后，见 §2.8） | 通过 |
+| **冷启动（上电 → 3A 首次收敛）** | 必须 | 修复前**每次上电都不出流**；修复后 PASS（见 §2.8） | 通过（已修） |
 | 长期稳定性 | 8 小时 | **8 小时干净收尾（线程化，864,001 帧 / 0 丢帧）** | 见 §1 长稳数据 |
 | **OSD 叠加** | 合成不拖慢编码 | 300/300 帧合成，**30.003 fps vs 无 OSD 30.000 fps** | 通过（零开销） |
 | **真实 IMU 数据面** | 进生产配置 | 30 分钟 54000 帧 30.000 fps，**抽帧数值在变** | 见 §1.4 |
@@ -53,15 +57,17 @@
 ### 尚未完成
 
 **功能项无：8 小时干净收尾已于 2026-09-28 达成**（见下），随后 2026-09-29 又把真实 IMU
-与 OSD 接进生产配置并跑完 30 分钟长稳（见 §1.3 / §1.4）。
+与 OSD 接进生产配置并跑完 30 分钟长稳（见 §1.3 / §1.4）；同日发现并修复了**冷启动竞态**
+（§2.8）—— 它此前**每次上电都不出流**。
 
 剩余的**全部是工程化收尾，不是功能**：
 
 ```text
+[x] 冷启动（上电 → 3A 首次收敛）完整验证 —— 已做，并因此发现+修复一个严重缺陷（§2.8）
 [ ] 网络断开/恢复专项测试（roadmap 列了，从未跑过）
 [ ] 端到端延迟的正式测量（只有 ffplay ~0.75s 粗测，无文档化方法）
 [ ] 架构图、演示视频
-[ ] 冷启动（上电 → 3A 首次收敛）的完整验证 —— fail-soft 已就位，只差自然断电重启实测
+[ ] restart 端到端回归（本轮被 USB 掉链打断，只做了新判据的静态验证，见 §2.8 末）
 ```
 
 ### 2 小时长稳：干净收尾已达成（2026-09-27，同步流水线）
@@ -380,6 +386,127 @@ OSD 代码，而原因在一个**安装脚本**里。
 > **另一条实践**：改配置改**仓库那份**再重装，**不要直接在板上改** —— 板上那份是副本，
 > 下一次重装会静默覆盖它。装完可用 `wc -c` + `diff` 核对两份是否逐字节一致。
 
+### 2.8 冷启动从来就没成功过：接管逻辑与厂商启动链的竞态（2026-09-29）
+
+**这是本项目最严重的一个缺陷：每次上电，板子都不出流。**
+
+**现象**（`adb reboot` 后抓的现场）：
+
+```text
+gateway: supervisor not running
+gateway: encoder not running
+gateway: 3A server not running
+gateway: warning, rkipc is running      <-- 只剩厂商的 rkipc
+8554:    (没有监听)
+```
+
+`/tmp/gateway-boot.log` 全文就是失败过程：
+
+```text
+14:11:20 start requested
+14:11:20 /userdata is ready
+14:11:20 no rkipc, nothing is initialising the camera, proceeding   <-- 判断错了
+14:11:21 rkipc pids before: []                                      <-- 杀了个空列表
+14:11:23 rkipc survived as [709], the capture node stays busy       <-- 放弃
+```
+
+`rkipc(709)` 的 `starttime` = **746 ticks = 开机后 7.46 秒**，两个 fd（44、52）指向
+`/dev/video11`。而 S99gateway 在**开机约 6 秒**就跑了 —— **它比 rkipc 早约 1.5 秒**。
+
+**根因：`RkLunch.sh` 把 rkipc 放在一个后台函数里启动。**
+
+```text
+/etc/init.d/S21appinit  最后一行:  sh /oem/usr/bin/RkLunch.sh
+
+RkLunch.sh:
+  rcS()      跑 /oem/usr/etc/init.d/S??*
+  post_chk() 等 /userdata 挂载 / insmod / network_init & / 多次 lsmod|grep
+             / cp rkipc.ini / cp image.bmp / rk_mpi_ao_test（放测试 WAV）
+             / luckfox-config / **最后一行才是 `rkipc -a ... &`**
+  末尾:      post_chk &     <-- 后台执行，所以 S21appinit 立刻返回
+```
+
+于是"现在没有 rkipc"和"rkipc 正要来"是两件事，而代码把它们当成了一件：
+
+| 场景 | S99gateway 看到的 | 真实情况 | 结果 |
+| --- | --- | --- | --- |
+| **冷启动** | 没有 rkipc | 1.5 秒后就来 | ❌ **放弃接管 → 开机无流** |
+| **restart** | 没有 rkipc | 永远不会有（RkLunch.sh 只在开机跑一次） | ✅ 正确跳过等待 |
+
+那句判断是上一轮修「restart 白等 20 秒」时加的 —— **那次修复本身没错**，
+只是**缺一个"这次是开机还是重启"的信息**。
+
+**曾试过但不可用的判据**：用「RkLunch.sh 进程还在不在」判断厂商链是否还在跑。
+**不可行**：该进程长期残留（实测 uptime 224 秒仍在，ppid=1、状态 S、
+`wchan=do_wait`、子进程列表为空）。**它的"不在"有意义，"在"没有意义。**
+
+**修复**（`scripts/S99gateway`）
+
+1. 新增 `uptime_seconds()`：读 `/proc/uptime`（板上没有 `stat`，这是唯一可用的单调时钟）。
+2. 新增 `wait_for_late_rkipc()`：rkipc 缺席时**不立刻下结论**，等它，但有**三条退出路径**：
+
+   | 退出条件 | 对应场景 |
+   | --- | --- |
+   | rkipc 出现了 | 冷启动的正常结局 |
+   | 厂商链进程消失 | 链跑完了也没起 rkipc，确实没得等 |
+   | **uptime 超过 30 秒** | 太晚不可能是开机 → 一定是 restart，没人会来 |
+
+   第三条是关键：**uptime 正是上一轮缺的那个信息。**
+3. `sleep 2` 盲等改成**有界轮询**，等 rkipc 进程和 `/dev/video11` 都真正空闲；
+   并新增一条断言——rkipc 退出后如果还有**别的**进程占着节点，大声失败（而不是带着
+   "device busy" 硬起）。
+
+**复验：冷启动 PASS**（同一条路径，跑修好的脚本）
+
+```text
+14:20:28 start requested
+14:20:32 rkipc appeared late (uptime 9s), it was on its way after all   <-- 等到了
+14:20:35 rkipc pids before: [873]
+14:20:37 rkipc is gone, /dev/video11 is free                            <-- 新断言
+14:20:40 3A server running as 1850
+14:20:42 gateway is up, supervisor pid 1864
+```
+
+| 时刻 | 事件 |
+| --- | --- |
+| boot+0 | 上电 |
+| boot+5 | S99gateway `start requested`（与旧代码**同一时刻**，说明时序没变，变的是逻辑） |
+| boot+9 | 迟到的 rkipc 被等到 |
+| boot+14 | rkipc 已杀、节点空闲 |
+| boot+19 | **gateway up** |
+
+**产出确认**：8554 在听、gateway 1873 / 3A 1850 在跑、rkipc 已杀、
+`IMU attached WHO_AM_I=0x70`；真拉流抽帧两帧成功，面板数值正常
+（`PITCH -0.4 ROLL +3.3 / ACC 0.99g TEMP 46.3C / FRAME 1231 30.0 FPS / IMU MPU6050 OK E=0`）。
+
+**restart 零回归**（板上静态验证新判据）：
+
+```text
+uptime_seconds       = 529
+vendor_chain_running -> RUNNING（RkLunch.sh 长期残留，符合预期）
+wait_for_late_rkipc  -> 返回 1，529s -> 530s      <-- 立即返回，没有白等 30 秒
+```
+
+> 🔴 **"开机 11 秒出流"这个数字要作废。** 它测的是一个**不可靠的路径**（S99gateway
+> 恰好晚于 rkipc 时）。现在的诚实数字是 **上电到出流约 19 秒**（接管本身 14 秒，
+> 其中包含等厂商链的 ~4 秒——这是必须付的代价），而旧代码在冷启动下是**永不**出流。
+>
+> 顺带纠正一条相关记录：`install_autostart.ps1` 里"禁用 rkipc init 脚本"那一步
+> 在这块板上是**空操作**（安装日志原文：`no rkipc init script found (it may be
+> started elsewhere)`）——因为 rkipc 根本不是 init.d 起的，是 `RkLunch.sh` 起的。
+
+**教训**
+
+- **"现在没有 X" 和 "X 不会来" 是两个判断。** 代码里凡是把两者合并的地方，都值得问
+  一句"凭什么"。这里凭的是"重启时 rkipc 不会来"，而那句话只在重启时成立。
+- **加一个"这次是开机还是重启"的信息，比猜一个超时值可靠得多。** uptime 是免费的。
+- **修复新场景不能把旧场景改回去。** 上一轮修"白等 20 秒"是对的，所以这一轮的退出
+  条件里必须有"uptime 超过阈值"，而不是简单地在缺 rkipc 时无条件多等 30 秒。
+- **"只验证了一半"的地方，就是 bug 藏身的地方。** 交接文档里那句
+  「冷启动只验证了一半（那次 3A 已在跑）」，指的正是这条路径。
+- **判活不必依赖 adb。** 本次验证过程中 USB 掉链，RTSP 走 TCP/IP，
+  `ping` + `/dev/tcp/172.32.0.93/8554` 就能判断板子和网关是否还活着。
+
 ---
 
 ## 3. 当前架构
@@ -611,7 +738,7 @@ powercfg /change hibernate-timeout-ac 0
    `|a| raw 1.056 / calibrated 0.996`，与 Python 黄金对照逐项一致。
    过程中修掉了两个只有真设备才暴露的 bug：缺 `-Isrc`（主机检查标志与真实构建不一致）
    与 **sysfs GPIO 写序**（`direction=in` 时写 `value` 返回 EPERM → 225 个 io error）。
-   下一步：Mock Sensor → OSD。
+   （当时写的"下一步：Mock Sensor → OSD"后来都已闭环，见下面第 4/5 项。）
 3. **✅ `S99gateway restart` 白等 20 秒已修复**（见 §7），并顺带修掉了
    `LD_LIBRARY_PATH` 重复追加（`S99gateway` 与 `gateway-supervise.sh` **两处都有**）、
    以及 Windows 检出导致的 CRLF shebang 问题。
@@ -623,15 +750,20 @@ powercfg /change hibernate-timeout-ac 0
    30 分钟 54000 帧 30.000 fps；解决了 bit-bang 总线 28 ms 导致的帧率塌陷
    （根因与三档对照见 §2.6）。
 6. **✅ 生产配置收敛为单一来源**（2026-09-29，见 §2.7）：`scripts/gateway.env`。
+7. **✅ 冷启动竞态已发现并修复**（2026-09-29，见 §2.8）：这是唯一一次"按计划去验证
+   一个已知的未验证路径，结果是坏的"。**每次上电都不出流**，根因是接管逻辑与
+   `RkLunch.sh` 后台启动 rkipc 的竞态；用 `/proc/uptime` 做开机/重启判别后修复，
+   冷启动复验 PASS（上电到出流约 19 秒），restart 路径经判据静态验证无回归。
 
 **剩下的是 P2 工程化收尾，都不是功能**：
 
 ```text
 [x] README.md / docs/handoff.md / roadmap.md 过时表述（2026-09-29 已对齐现状）
+[x] 冷启动（上电 → 3A 首次收敛）完整验证 —— 已做，并发现+修复严重缺陷（§2.8）
 [ ] 网络断开/恢复专项测试（roadmap 列了，从未跑过）
 [ ] 端到端延迟的正式测量（只有 ffplay ~0.75s 粗测）
 [ ] 架构图、演示视频
-[ ] 冷启动（上电 → 3A 首次收敛）的完整验证 —— fail-soft 已就位，只差自然断电重启实测
+[ ] restart 端到端回归（本轮被 USB 掉链打断）
 ```
 
 > 最新、最全的完成清单与每项证据见 **`docs/agent-handoff.md`**。
