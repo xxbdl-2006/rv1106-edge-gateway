@@ -36,3 +36,7 @@ datasheets/
 
 # Previous board binary saved by verify-osd.sh before it overwrites it.
 /v4l2_mpp_encode.prev
+
+# Working directory of scripts/verify-osd.sh: pulled clips and decoded frames.
+# Kept on failure so the evidence survives, so it must not be committed.
+/.osd-verify/

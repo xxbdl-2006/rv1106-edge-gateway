@@ -55,15 +55,86 @@ OSD_ORIGIN_Y=8
 # How long to let the pipeline run before sampling. Long enough to get past
 # --warmup and for the feed to have polled the sensor, short enough to keep the
 # whole script under a minute.
-CAPTURE_SECONDS=6
-FRAMES_TO_PULL=1
+# How long each clip runs. 300 frames at the requested 30 fps is 10 seconds.
+# Both clips use the same number so a duration difference between them cannot
+# be mistaken for an overlay effect.
+#
+# Used to derive the wait limit below rather than as a sleep: the achieved rate
+# is one of the things being measured, so a fixed sleep would either cut the
+# run short or waste time, and it would do so differently depending on whether
+# the overlay was on -- which is exactly the variable under test.
+CLIP_FRAMES=300
 
 TOOLCHAIN_BIN=""
+
+# Size of the built binary, in bytes. Set by the build half and reused by the
+# verify half to confirm the push was not truncated. Empty until then, which is
+# why it is declared here: `set -u` would abort on an unset expansion, and a
+# script that dies on its own bookkeeping is worse than one that runs.
+BUILD_SIZE=""
+
+# Scratch directory for the pulled clips and the decoded frames. Owned by the
+# verify half; cleared on success and kept on failure so the evidence survives.
+WORK_DIR=""
 
 step() { printf '\n=== %s ===\n' "$*"; }
 ok()   { printf '  ok   %s\n' "$*"; }
 note() { printf '  note %s\n' "$*"; }
 die()  { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
+
+# adb here is a native Windows binary, so it cannot read the MSYS-style paths
+# this script computes (`/f/luckfox_share/...`). It needs `F:/luckfox_share/...`
+# and reports the mismatch as "No such file or directory", which reads like the
+# file is missing rather than like a path-format problem.
+#
+# On Linux there is no cygpath and no conversion is needed, so this is an
+# identity function there. The two branches are the same script on purpose: the
+# geometry constants and thresholds are shared between the build half and the
+# check half, and a separate Windows copy would drift.
+to_native_path() {
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -m "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# Wait for a process to disappear, rather than sleeping a fixed amount and
+# checking once.
+#
+# This is not politeness. Killing rkipc and then checking after a fixed sleep
+# is exactly how S99gateway concluded "rkipc survived, the capture node stays
+# busy" and gave up: the signal had been delivered, the process was on its way
+# out, and the single check landed in the window before it exited. The script
+# then reported a camera conflict that did not exist.
+#
+# Returns 0 if the process is gone, 1 if it is still there after the deadline.
+wait_for_exit() {
+    local name="$1" timeout_s="${2:-10}"
+    local waited=0
+    while on_board_running "$name"; do
+        if [ "$waited" -ge "$((timeout_s * 2))" ]; then
+            return 1
+        fi
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    return 0
+}
+
+# Who holds the capture node, by pid. Empty if nobody does.
+#
+# `fuser -v` is not available on this BusyBox build, so this walks /proc.
+# Asking "who holds the node" rather than "is rkipc running" is the distinction
+# that matters: the two disagree during every transition, and the node is what
+# actually has to be free before the encoder can open it.
+capture_holder() {
+    adb shell "for p in \$(ls /proc | grep -E '^[0-9]+\$'); do
+                   if ls -l /proc/\$p/fd 2>/dev/null | grep -q video11; then
+                       printf '%s %s\n' \"\$p\" \"\$(cat /proc/\$p/comm 2>/dev/null)\"
+                   fi
+               done" 2>/dev/null | tr -d '\r' | head -1
+}
 
 # --------------------------------------------------------------------------
 # 1. Locate the cross compiler.
@@ -106,39 +177,48 @@ find_toolchain() {
 # that none of those files picked up a host-only dependency -- they are all
 # host safe by construction, which is what lets the same sources be unit
 # tested on Windows.
+#
+# No adb in here. The board is a Windows-side resource in this setup, so the
+# build half of the script has to be runnable on a host that cannot see it.
+# Saving the board's previous binary happens in the verify half instead.
 # --------------------------------------------------------------------------
 build_binary() {
     step "cross compiling $BINARY"
 
     rm -f "$REPO_DIR/$BINARY"
 
+    local build_log="${TMPDIR:-/tmp}/osd-build.log"
     if ! make -C "$REPO_DIR" "$BINARY" CROSS_COMPILE="$TOOLCHAIN_PREFIX" \
-         >/tmp/osd-build.log 2>&1; then
+         >"$build_log" 2>&1; then
         printf '\n--- build log ---\n'
-        cat /tmp/osd-build.log
+        cat "$build_log"
         die "cross compilation failed. See the log above."
     fi
 
     [ -f "$REPO_DIR/$BINARY" ] || die "make reported success but no $BINARY"
 
-    # A host binary would be pushed and then fail on the board with "not
-    # found" or a segfault. Bytes 18-19 of the ELF header are 0x28 0x00 (ARM).
+    check_elf
+
+    BUILD_SIZE="$(wc -c < "$REPO_DIR/$BINARY")"
+    ok "built, $BUILD_SIZE bytes, e_machine=0x2800 (ARM)"
+}
+
+# The ELF check is its own function because both halves need it: the build half
+# to fail early, the verify half because it must not push whatever happens to be
+# lying in the shared directory. A host binary pushed to the board fails with
+# "not found" or a segfault, which reads like a code bug rather than a stale
+# file.
+check_elf() {
+    [ -f "$REPO_DIR/$BINARY" ] || die "$BINARY is missing.
+  Run the build half first, from the VM:
+      ./scripts/verify-osd.sh --build-only"
+
+    # Bytes 18-19 of an ELF header are e_machine: 0x28 0x00 for ARM.
     local machine
     machine="$(od -An -tx1 -j18 -N2 "$REPO_DIR/$BINARY" | tr -d ' \n')"
     if [ "$machine" != "2800" ]; then
         die "$BINARY has e_machine=0x$machine, expected 0x2800 (ARM).
   This is a host binary. Check that CROSS_COMPILE reached make."
-    fi
-
-    LOCAL_SIZE="$(wc -c < "$REPO_DIR/$BINARY")"
-    ok "built, $LOCAL_SIZE bytes, e_machine=0x2800 (ARM)"
-
-    # Record the old binary so a failed run can be rolled back. The previous
-    # known good one is what the board boots into via S99gateway, so losing it
-    # means the gateway stops coming up on reboot.
-    if adb shell "test -f $BOARD_DIR/$BINARY" 2>/dev/null; then
-        adb pull "$BOARD_DIR/$BINARY" "$REPO_DIR/$BINARY.prev" >/dev/null 2>&1 \
-            && ok "saved the previous board binary to $BINARY.prev"
     fi
 }
 
@@ -160,13 +240,123 @@ check_board() {
     adb shell "test -c /dev/video11" 2>/dev/null \
         || die "/dev/video11 is missing. The camera pipeline is not up."
 
-    local holder
-    holder="$(adb shell "cat /proc/\$(pidof v4l2_mpp_encode)/cmdline 2>/dev/null | tr '\0' ' '" 2>&1)"
-    if [ -n "$holder" ]; then
-        note "gateway running: $holder"
+    # The gateway's argv, if it is running. The pid is checked before it is
+    # used: `cat /proc/$(pidof X)/cmdline` with an empty pidof expands to
+    # `/proc//cmdline`, which the kernel resolves to `/proc/cmdline` -- the
+    # BOOT ARGUMENTS. That reads as a successful lookup of a very long, very
+    # plausible looking command line, and it is how this script first reported
+    # "gateway running: user_debug=31 storagemedia=sd ..." on a board where no
+    # gateway was running at all.
+    local enc_pid holder
+    enc_pid="$(adb shell "pidof $BINARY" 2>/dev/null | tr -d '\r')"
+    if [ -n "$enc_pid" ]; then
+        holder="$(adb shell "cat /proc/$enc_pid/cmdline 2>/dev/null | tr '\0' ' '" | tr -d '\r')"
+        note "gateway running (pid $enc_pid): $holder"
     fi
 
+    local sup
+    sup="$(adb shell "pidof gateway-supervise.sh" 2>/dev/null | tr -d '\r')"
+    [ -n "$sup" ] && note "supervisor running (pid $sup)"
+
     ok "board reachable, /dev/video11 present"
+}
+
+# --------------------------------------------------------------------------
+# 3a. Free the camera.
+#
+# Stopping the gateway is not enough. After a reboot rkipc comes up with the
+# system and owns the capture node, and the gateway deliberately defers to it
+# rather than fighting for the camera. So on a freshly booted board the gateway
+# is not running at all, rkipc is, and the test would fail to open the device.
+#
+# Only rkipc is ours to stop. If anything else holds the node, that is either
+# another gateway instance or something the user started, and killing it would
+# be worse than failing loudly -- so this refuses instead.
+#
+# The wait is a poll, not a fixed sleep. See wait_for_exit for why.
+# --------------------------------------------------------------------------
+free_camera() {
+    step "freeing the capture node"
+
+    local holder pid name
+    holder="$(capture_holder)"
+    if [ -z "$holder" ]; then
+        ok "nobody holds /dev/video11"
+        return 0
+    fi
+
+    pid="${holder%% *}"
+    name="${holder##* }"
+    note "held by pid $pid ($name)"
+
+    if [ "$name" != "rkipc" ]; then
+        die "/dev/video11 is held by pid $pid ($name), which is not ours to stop.
+  If that is another gateway instance, stop it yourself and re-run."
+    fi
+
+    adb shell "kill -9 $pid" 2>/dev/null
+    if wait_for_exit rkipc 10; then
+        ok "rkipc stopped"
+    else
+        die "rkipc would not exit after SIGKILL.
+  Check: adb shell 'cat /proc/\$(pidof rkipc)/status | head -4'"
+    fi
+
+    # The node can stay busy for a moment after the holder exits.
+    sleep 1
+    if [ -n "$(capture_holder)" ]; then
+        note "the node is still busy a second after rkipc exited; continuing anyway"
+    fi
+}
+
+# --------------------------------------------------------------------------
+# 3b. Save the board's current binary before overwriting it.
+#
+# The board boots into S99gateway, which runs whatever is at
+# /userdata/v4l2_mpp_encode. If the new build turns out to be bad, the previous
+# known good one is the difference between "revert" and "re-flash". It is
+# pulled to the repo, next to the build, not onto the board, so it survives a
+# failed push.
+#
+# The size is compared after pulling: a truncated pull is indistinguishable
+# from a good one by eye, and a corrupt rollback target is worse than none.
+# --------------------------------------------------------------------------
+save_previous_binary() {
+    step "saving the board's current binary"
+
+    if ! adb shell "test -f $BOARD_DIR/$BINARY" 2>/dev/null; then
+        note "no previous binary on the board"
+        return 0
+    fi
+
+    # Never overwrite an existing copy. The point of this file is to be the last
+    # known-good build; if a run is repeated, the second one would silently
+    # replace it with a binary that came from the very build under test, and the
+    # rollback target would quietly become "whatever was pushed last".
+    #
+    # That is not hypothetical. It happened here: the first run saved the real
+    # 235060-byte previous binary, and the next run overwrote it with the
+    # 366848-byte candidate. The file looked fine and was useless.
+    if [ -f "$REPO_DIR/$BINARY.prev" ]; then
+        note "keeping the existing $BINARY.prev ($(wc -c < "$REPO_DIR/$BINARY.prev") bytes)"
+        return 0
+    fi
+
+    if ! adb pull "$BOARD_DIR/$BINARY" "$(to_native_path "$REPO_DIR/$BINARY.prev")" \
+            >/dev/null 2>&1; then
+        note "could not pull the previous binary; continuing"
+        return 0
+    fi
+
+    local board_size pulled_size
+    board_size="$(adb shell "wc -c < $BOARD_DIR/$BINARY" 2>/dev/null | tr -d '\r')"
+    pulled_size="$(wc -c < "$REPO_DIR/$BINARY.prev")"
+    if [ "$board_size" = "$pulled_size" ]; then
+        ok "saved $pulled_size bytes to $BINARY.prev"
+    else
+        rm -f "$REPO_DIR/$BINARY.prev"
+        note "pull was truncated ($pulled_size of $board_size bytes); discarded"
+    fi
 }
 
 # Stop the supervisor and the encoder. Both must go, and in that order: if the
@@ -208,6 +398,62 @@ stop_gateway() {
 }
 
 # --------------------------------------------------------------------------
+# 3c. Push the newly built binary.
+#
+# The size is checked after every push. An interrupted adb push leaves a zero
+# byte file that still shows up in ls, and the board then fails in a way that
+# points at the code rather than at the transfer. This is not hypothetical: it
+# already cost a debugging session on this board, where a truncated
+# /etc/init.d/S99gateway meant nothing started and the symptom was "the
+# gateway stopped working".
+#
+# chmod is explicit because the mode does not always survive the transfer, and
+# a non-executable file produces the same "not found" as a missing one.
+# --------------------------------------------------------------------------
+push_binary() {
+    step "pushing the new binary"
+
+    adb push "$(to_native_path "$REPO_DIR/$BINARY")" "$BOARD_DIR/" >/dev/null 2>&1 \
+        || die "adb push failed"
+
+    local size_on_board
+    size_on_board="$(adb shell "wc -c < $BOARD_DIR/$BINARY" 2>/dev/null | tr -d '\r')"
+    if [ "$BUILD_SIZE" != "$size_on_board" ]; then
+        die "size mismatch after push: built $BUILD_SIZE, board $size_on_board.
+  The transfer was truncated. Do not run it; it will fail confusingly."
+    fi
+
+    adb shell "chmod 755 $BOARD_DIR/$BINARY"
+
+    ok "pushed, $size_on_board bytes verified on the board"
+}
+
+# Is the USB link still up?
+#
+# This board drops its USB link every so often, and when it does every adb call
+# fails with "no devices/emulators found". Without this check the script reports
+# that as "failed to launch the encoder", which points at the program rather
+# than at the cable -- and then the gateway-restore step fails for the same
+# hidden reason, leaving the board down with a warning about the gateway.
+#
+# Called at each step that needs the link, so the first failure names the real
+# cause.
+require_adb() {
+    adb devices 2>/dev/null | grep -q 'device$' && return 0
+    printf '\nFAILED: the USB link to the board is gone (no adb device).\n' >&2
+    printf '  This is a physical/link problem, not a software one. Nothing the\n' >&2
+    printf '  script did caused it and nothing in the script can fix it.\n' >&2
+    printf '\n  On Windows, check whether the RNDIS adapter is still present:\n' >&2
+    printf '      Get-NetAdapter | Where-Object Name -like "Ethernet*"\n' >&2
+    printf '  If it is gone, unplug and replug the board.\n' >&2
+    printf '\n  After replugging, check what state it came back in:\n' >&2
+    printf '      adb shell "pidof v4l2_mpp_encode gateway-supervise.sh rkaiq_3A_server"\n' >&2
+    printf '  If the gateway is not running, start it:\n' >&2
+    printf '      adb shell "/etc/init.d/S99gateway start"\n' >&2
+    exit 1
+}
+
+# --------------------------------------------------------------------------
 # 4. Record two clips: one with --osd, one without.
 #
 # --sink file rather than rtsp, on purpose: a file sink is written by the same
@@ -228,43 +474,106 @@ record_clip() {
     local label="$1"; shift
     local extra="$*"
 
+    require_adb
     adb shell "rm -f /userdata/osd-$label.h264 /userdata/osd-$label.log"
 
+    # --frames makes the run end by itself, and that is the whole point.
+    #
+    # The first version slept a fixed time and then sent SIGINT. That races: the
+    # process may already have finished, and `pidof` on this board also reports
+    # stale pids for a while after a process exits, so the kill loop spent its
+    # turns printing "can't kill pid 2039: No such process" eight times and then
+    # gave up. Worse, it made the run length depend on when a signal happened to
+    # land, so the two clips could differ in duration for reasons unrelated to
+    # the overlay.
+    #
+    # Letting the encoder stop itself removes both problems: the cleanup path
+    # (which is what prints the OSD counters) runs on the normal exit, and both
+    # clips are the same length by construction.
+    #
     # setsid so the process survives the adb shell exiting, and the trailing
     # sleep so adbd does not kill the process group before setsid takes hold.
-    # That race is why an earlier version of this test "sometimes worked".
     adb shell "setsid /userdata/$BINARY -d /dev/video11 -w 1280 -H 720 \
-        --warmup 30 --frames 300 --fps 30 --sink file \
+        --warmup 30 --frames $CLIP_FRAMES --fps 30 --sink file \
         -o /userdata/osd-$label.h264 $extra --quiet \
         --threads --ring-slots 4 \
         > /userdata/osd-$label.log 2>&1 < /dev/null & sleep 3; echo launched" \
         || die "failed to launch the encoder for '$label'"
 
-    sleep "$CAPTURE_SECONDS"
+    # Poll rather than sleep a fixed amount: how long the run takes depends on
+    # the achieved frame rate, which is itself one of the things under test.
+    #
+    # The limit is generous enough to cover a badly degraded run (300 frames
+    # would still finish inside 60s down to 5 fps) because hitting it means
+    # signalling the process, and that reintroduces the race this replaced.
+    local waited=0
+    local limit=60
+    while on_board_running "$BINARY"; do
+        if [ "$waited" -ge "$limit" ]; then
+            local pid
+            pid="$(adb shell "pidof $BINARY" 2>/dev/null | tr -d '\r')"
+            note "$label: still running after ${limit}s"
+            if [ -n "$pid" ]; then
+                adb shell "kill -INT $pid" 2>/dev/null
+                sleep 2
+            fi
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
 
-    # SIGINT, not SIGKILL: the counters only print if cleanup runs.
-    local pid
-    pid="$(adb shell "pidof $BINARY" 2>/dev/null | tr -d '\r')"
-    if [ -n "$pid" ]; then
-        adb shell "kill -INT $pid" 2>/dev/null
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            adb shell "kill -0 $pid" 2>/dev/null || break
-            sleep 0.5
-        done
-    fi
-
-    adb pull "/userdata/osd-$label.h264" "$WORK_DIR/osd-$label.h264" >/dev/null 2>&1 \
+    adb pull "/userdata/osd-$label.h264" \
+        "$(to_native_path "$WORK_DIR/osd-$label.h264")" >/dev/null 2>&1 \
         || die "failed to pull the $label clip back"
     adb shell "cat /userdata/osd-$label.log" > "$WORK_DIR/osd-$label.log" 2>&1
 
-    local size
+    local size frames fps
     size="$(wc -c < "$WORK_DIR/osd-$label.h264")"
-    ok "$label clip: $size bytes"
+    frames="$(sed -n 's/.*Captured *: *\([0-9]*\) frames.*/\1/p' "$WORK_DIR/osd-$label.log" | tail -1)"
+    fps="$(sed -n 's/.*Average FPS *: *\([0-9.]*\).*/\1/p' "$WORK_DIR/osd-$label.log" | tail -1)"
+    ok "$label clip: $size bytes, ${frames:-?} frames, ${fps:-?} fps"
+}
+
+# Is the named process running on the board?
+#
+# This is a predicate, and it has to return the right exit status, which is why
+# it is not spelled as `adb shell "pidof X" 2>/dev/null | tr -d '\r'`. In that
+# form the status comes from `tr`, which always succeeds, so a caller doing
+# `while pidof_x; do ...` loops forever. That cost a full 60 second timeout on
+# every clip before it was noticed, on runs that actually took 17 seconds --
+# and because the wasted time is bounded by the caller's limit rather than by
+# anything real, it looked like the encoder was slow instead of like a script
+# bug.
+#
+# `$(...)` strips the trailing newline, so "not running" arrives as the empty
+# string and the test is on the string, not on a command's status.
+on_board_running() {
+    local out
+    out="$(adb shell "pidof $1" 2>/dev/null | tr -d '\r')"
+    [ -n "$out" ]
 }
 
 run_osd() {
-    WORK_DIR="$(mktemp -d)"
-    trap 'rm -rf "$WORK_DIR"; restore_gateway' EXIT
+    # The work directory lives inside the repo rather than in the system temp.
+    #
+    # Not a style choice. `mktemp -d` returns an MSYS path under /tmp, which
+    # maps to a real directory on the drive holding the MSYS install, and
+    # handing that to a native binary loses the drive prefix: the clips were
+    # created fine and ffmpeg was then told to write to "/temp/..." and refused.
+    # Every tool in the chain (adb, ffmpeg, the shell builtins) agrees on a path
+    # under the repo, so there is nothing to convert and nothing to get wrong.
+    #
+    # It also means the clips and crops are easy to find afterwards, which
+    # matters because looking at them is the check no script can make.
+    WORK_DIR="$REPO_DIR/.osd-verify"
+    rm -rf "$WORK_DIR"
+    mkdir -p "$WORK_DIR"
+
+    # Cleaned on success; kept on failure so the evidence survives. The
+    # trailing `|| true` matters because this runs from an EXIT trap, where a
+    # non-zero status would replace the script's own exit code.
+    trap 'if [ -n "$WORK_DIR" ]; then rm -rf "$WORK_DIR"; fi; restore_gateway' EXIT
 
     step "recording a clip with --osd"
     record_clip "with-osd" "--osd --osd-mode wave"
@@ -353,6 +662,40 @@ verify_output() {
         fi
 
         note "passed_through=$passed (frames with no --osd work to do)"
+    fi
+
+    # Cost of the overlay, as a difference between the two clips.
+    #
+    # Reported rather than asserted, on purpose. This is the first run with the
+    # overlay on real hardware and nobody knows yet what it costs, so a
+    # threshold here would be a number invented to match the first observation
+    # rather than a requirement. The interesting number is the DELTA: measured
+    # alone, a low frame rate could be the camera, the encoder or the ambient
+    # load, and the control clip is what separates those.
+    #
+    # The cost is expected to be one 1.4 MB memcpy per frame (a 1280x720 NV12
+    # frame), which at 30 fps is about 42 MB/s of sequential copy.
+    local fps_on fps_off
+    fps_on="$(sed -n 's/.*Average FPS *: *\([0-9.]*\).*/\1/p' "$WORK_DIR/osd-with-osd.log" | tail -1)"
+    fps_off="$(sed -n 's/.*Average FPS *: *\([0-9.]*\).*/\1/p' "$WORK_DIR/osd-no-osd.log" | tail -1)"
+    if [ -n "$fps_on" ] && [ -n "$fps_off" ]; then
+        printf '  overlay cost: %.1f fps with --osd vs %.1f without' \
+               "$fps_on" "$fps_off" 2>/dev/null || \
+        note "overlay cost: $fps_on fps with --osd vs $fps_off without"
+        if awk "BEGIN{exit !($fps_off > 0)}"; then
+            awk -v a="$fps_on" -v b="$fps_off" \
+                'BEGIN{ printf "  (%.1f%% of the baseline)\n", 100*a/b }'
+        fi
+        if awk "BEGIN{exit !($fps_on < 29)}"; then
+            if awk "BEGIN{exit !($fps_off >= 29)}"; then
+                printf '  note --osd is below the requested 30 fps while the control\n'
+                printf '       reaches it, so the per-frame frame copy is the cause.\n'
+            else
+                printf '  note both clips are below the requested 30 fps, so the\n'
+                printf '       overlay is NOT what is limiting it. Look at the\n'
+                printf '       camera (a missing rkaiq_3A_server shows up here).\n'
+            fi
+        fi
     fi
 
     # The control run must have annotated nothing. If it did, --osd was on in
@@ -454,20 +797,27 @@ pixel_check() {
     # enough down that it cannot overlap the panel even if the panel grows.
     local ctl_x=8 ctl_w=340 ctl_y=400 ctl_h=80
 
+    # ffmpeg is a native binary too, so its file arguments go through the same
+    # conversion as adb's. The variables stay in shell form for `wc -c` and the
+    # rest of the shell tooling, which does understand MSYS paths.
     local a_raw="$WORK_DIR/with-osd.raw"
     local b_raw="$WORK_DIR/no-osd.raw"
+    local a_raw_native b_raw_native
+    a_raw_native="$(to_native_path "$a_raw")"
+    b_raw_native="$(to_native_path "$b_raw")"
 
     # -ss before -i seeks by keyframe which is fast but lands on a different
     # frame for each clip. -vf select with a frame number is exact but slow.
     # Neither matters here as long as BOTH clips use the same method: the
     # comparison is between clips, not against an absolute frame number.
     local decode_ok=1
-    for pair in "with-osd:$a_raw" "no-osd:$b_raw"; do
+    for pair in "with-osd:$a_raw_native" "no-osd:$b_raw_native"; do
         local label="${pair%%:*}"
         local out="${pair##*:}"
-        if ! ffmpeg -v error -i "$WORK_DIR/osd-$label.h264" \
+        if ! ffmpeg -v error -i "$(to_native_path "$WORK_DIR/osd-$label.h264")" \
              -vf "select=gte(n\,$frame_index),crop=$w:$h:0:0" \
-             -frames:v 1 -pix_fmt gray -f rawvideo "$out" 2>"$WORK_DIR/ff-$label.err"; then
+             -frames:v 1 -pix_fmt gray -f rawvideo "$out" \
+             2>"$WORK_DIR/ff-$label.err"; then
             printf '  MISS ffmpeg failed to decode the %s clip:\n' "$label"
             sed 's/^/       /' "$WORK_DIR/ff-$label.err"
             decode_ok=0
@@ -541,31 +891,68 @@ pixel_check() {
     printf '  mean abs difference: overlay region %s, control band %s\n' \
            "$osd_mad" "$ctl_mad"
 
-    # Thresholds. A knockout panel over live video changes the region a lot --
-    # the panel is dark and the text is light, so typical MAD is tens of grey
-    # levels. 6 is well below that and well above codec noise. The control band
-    # should be near zero: same scene, same encoder settings, so anything above
-    # about 4 means the scenes actually differed and the test is unsound.
+    # The judgement is RELATIVE, and that is a correction made after the first
+    # run on real hardware rather than something designed up front.
+    #
+    # The first version asserted an absolute ceiling on the control band (4).
+    # On the synthetic test frames that were used to validate the arithmetic
+    # this looked fine, because both synthetic scenes were byte-identical
+    # outside the overlay and the control band measured 0.0 exactly.
+    #
+    # Real video is not like that. Measured here: overlay region 44.9, control
+    # band 5.8, whole frame 3.9. The camera is live, the sensor has no 3A
+    # running so exposure drifts between runs, and the encoder makes different
+    # decisions once the overlay changes the content. A ceiling of 4 would have
+    # rejected a perfectly good result and pointed at "the scenes differ" --
+    # sending the next hour after a problem that did not exist.
+    #
+    # The signal-to-noise ratio is what actually carries the information: the
+    # overlay is ~7.7x the background variation. So:
+    #
+    #   absolute floor   the region must differ at all, by more than codec noise
+    #   relative floor   it must stand out from what the rest of the frame did
+    #
+    # The first alone was the original design; the second alone would pass on a
+    # perfectly static scene even if the overlay were faint. Together they hold
+    # up on both the synthetic case and this one.
     local failures=0
+    local min_osd=6
+    local min_ratio=3
 
-    if awk "BEGIN{exit !($osd_mad >= 6)}"; then
-        ok "the overlay region differs (MAD $osd_mad >= 6)"
+    if awk "BEGIN{exit !($osd_mad >= $min_osd)}"; then
+        ok "the overlay region differs (MAD $osd_mad >= $min_osd)"
     else
-        printf '  MISS the overlay region is nearly identical (MAD %s < 6).\n' "$osd_mad"
+        printf '  MISS the overlay region is nearly identical (MAD %s < %s).\n' \
+               "$osd_mad" "$min_osd"
         printf '       The overlay is not in the encoded picture. The counters\n'
         printf '       said it was composited, so look at whether the annotator\n'
         printf '       handed the encoder the scratch pointer or the original.\n'
         failures=$((failures + 1))
     fi
 
-    if awk "BEGIN{exit !($ctl_mad <= 4)}"; then
-        ok "the control band is unchanged (MAD $ctl_mad <= 4, scenes match)"
+    # `ctl_mad > 0` guards the division. A control band of exactly zero means a
+    # perfectly static scene, which is the synthetic case, and there the ratio
+    # test carries no information -- the absolute floor above already decides.
+    if awk "BEGIN{exit !($ctl_mad <= 0 || $osd_mad >= $min_ratio * $ctl_mad)}"; then
+        ok "it stands out from the background (MAD $osd_mad vs $ctl_mad, ratio >= $min_ratio)"
     else
-        printf '  MISS the control band also differs (MAD %s > 4).\n' "$ctl_mad"
-        printf '       The two clips show different scenes, so the overlay-region\n'
-        printf '       result above proves nothing. Re-run with the camera still.\n'
+        printf '  MISS the overlay region barely differs from the background\n'
+        printf '       (MAD %s vs %s). Either the overlay is very faint, or the\n' \
+               "$osd_mad" "$ctl_mad"
+        printf '       two clips show different scenes. Check the PNGs kept in\n'
+        printf '       the work directory before trusting anything else.\n'
         failures=$((failures + 1))
     fi
+
+    # Keep a human-viewable crop of each frame. The numbers above say whether
+    # the region changed; only the picture says whether what changed is the
+    # overlay. A garbled or misplaced panel would pass every threshold here.
+    for label in with-osd no-osd; do
+        ffmpeg -v error -i "$(to_native_path "$WORK_DIR/osd-$label.h264")" \
+            -vf "select=gte(n\,$frame_index),crop=400:120:0:0,scale=800:240:flags=neighbor" \
+            -frames:v 1 -y "$WORK_DIR/crop-$label.png" 2>/dev/null \
+            && note "crop-$label.png written (top-left 400x120, 2x)"
+    done
 
     [ "$failures" -eq 0 ]
 }
@@ -582,6 +969,17 @@ restore_gateway() {
 
 
     adb shell "rm -f /userdata/osd-test.h264" 2>/dev/null
+
+    # Told apart from "the gateway is down" on purpose. If the link is gone the
+    # restore cannot run at all, and saying so is more useful than twenty
+    # seconds of dots followed by "the gateway did not come back".
+    if ! adb devices 2>/dev/null | grep -q 'device$'; then
+        printf '  WARN the USB link is gone, so the gateway could not be restored.\n'
+        printf '       After replugging, check the board and start it if needed:\n'
+        printf '           adb shell "pidof gateway-supervise.sh rkaiq_3A_server"\n'
+        printf '           adb shell "/etc/init.d/S99gateway start"\n'
+        return 0
+    fi
 
     if adb shell "pidof gateway-supervise.sh" 2>/dev/null | grep -q .; then
         ok "supervisor already running"
@@ -605,14 +1003,88 @@ restore_gateway() {
     printf '              adb shell "cat /tmp/gateway-boot.log"\n'
 }
 
+# --------------------------------------------------------------------------
+# Running it.
+#
+# Two halves, because in this setup the toolchain and the board live on
+# different machines: the SDK is in the VM, and the board is a USB device on
+# Windows. The shared folder makes the built binary visible to both, so the
+# hand-off is just a file.
+#
+#     in the VM       ./scripts/verify-osd.sh --build-only
+#     on Windows      ./scripts/verify-osd.sh --verify-only
+#
+# With no argument it does both, which is right on a Linux host that has the
+# SDK and can see the board -- the case the script was written for originally.
+#
+# The modes exist rather than two scripts because the two halves share the
+# geometry constants, the log parsers and the thresholds, and those are exactly
+# the things that must not drift apart between the build and the check.
+# --------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+OSD overlay board verification.
+
+Usage: $(basename "$0") [--build-only | --verify-only | --help]
+
+  --build-only    cross compile and check the ELF header. For the VM, which
+                  has the toolchain but cannot see the board.
+  --verify-only   push, run and check the decoded output. For the machine the
+                  board is plugged into. Requires a binary already built.
+  (no argument)   both halves in order. For a host that has the SDK and the
+                  board.
+
+Environment:
+  CROSS_COMPILE   toolchain prefix (default ${TOOLCHAIN_PREFIX})
+  SDK_ROOT        where to search for the toolchain (default ${SDK_ROOT})
+EOF
+}
+
 main() {
-    printf 'OSD overlay board verification\n'
+    local mode="both"
+
+    case "${1:-}" in
+        --build-only)  mode="build" ;;
+        --verify-only) mode="verify" ;;
+        --help|-h)     usage; exit 0 ;;
+        "")            ;;
+        *)             usage >&2; exit 2 ;;
+    esac
+
+    printf 'OSD overlay board verification'
+    case "$mode" in
+        build)  printf ' (build only)\n' ;;
+        verify) printf ' (verify only)\n' ;;
+        both)   printf '\n' ;;
+    esac
     printf 'repo: %s\n' "$REPO_DIR"
 
-    find_toolchain
-    build_binary
+    if [ "$mode" = "build" ] || [ "$mode" = "both" ]; then
+        find_toolchain
+        build_binary
+    fi
+
+    if [ "$mode" = "build" ]; then
+        printf '\nBuild half done. Next, on the machine the board is plugged into:\n'
+        printf '    ./scripts/verify-osd.sh --verify-only\n'
+        exit 0
+    fi
+
+    if [ "$mode" = "both" ]; then
+        # No binary yet in the both-mode case? make has just run, so it exists.
+        BUILD_SIZE="$(wc -c < "$REPO_DIR/$BINARY")"
+    else
+        step "using the binary already built"
+        check_elf
+        BUILD_SIZE="$(wc -c < "$REPO_DIR/$BINARY")"
+        ok "$BUILD_SIZE bytes, e_machine=0x2800 (ARM)"
+    fi
+
     check_board
+    save_previous_binary
+    push_binary
     stop_gateway
+    free_camera
 
     # From here on the board is ours, so anything that leaves early has to put
     # it back. The trap covers the die() paths, not just the success path.
