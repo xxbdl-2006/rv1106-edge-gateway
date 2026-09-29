@@ -372,6 +372,18 @@ run_encoder_with_imu_osd() {
 --osd --osd-source mpu6050 --frames $CLIP_FRAMES" 2>&1 \
         | tr -d '\r' | tee "$OSD_LOG"
 
+    # The one failure this script must not swallow. A missing IMU no longer
+    # stops the program - it streams on without the overlay - which is right for
+    # a board that boots unattended and wrong for a bench that is trying to
+    # prove the IMU works. Without this check a dead part would produce a run
+    # with no OSD line and then be judged on counters that were never printed,
+    # and "it passed" would mean "the sensor was not there".
+    if grep -q "IMU unavailable" "$OSD_LOG"; then
+        die "the IMU did not attach and the encoder fell back to no overlay.
+  The fallback is meant for a board that boots with the part missing, not for a
+  verification run. Fix the bus, then run this again."
+    fi
+
     if ! grep -q "OSD annotated" "$OSD_LOG"; then
         die "the encoder never printed its OSD counters; see $OSD_LOG"
     fi

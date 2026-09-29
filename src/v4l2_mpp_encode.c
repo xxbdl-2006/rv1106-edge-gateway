@@ -844,6 +844,13 @@ int main(int argc, char **argv)
 
         memset(&osd_source, 0, sizeof(osd_source));
 
+        /*
+         * Whether a source was actually obtained. Cleared in exactly one place,
+         * described there: the case where carrying on without the overlay is
+         * better than not carrying on at all.
+         */
+        bool source_ready = true;
+
         if (strcmp(options.osd_source, "mpu6050") == 0) {
             struct mpu6050_source_config imu_config;
 
@@ -872,33 +879,56 @@ int main(int argc, char **argv)
                 imu_config.min_interval_us = imu_interval_us;
             }
 
+            /*
+             * Soft failure, and the only one in this program. The part is a
+             * piece of hardware bolted to the board and it may simply not
+             * answer: no module, pins taken by something else, or a bus that
+             * has not settled while the camera pipeline is still coming up at
+             * boot - which is exactly when this runs from the startup script.
+             * Dying here trades a missing attitude readout for a missing video
+             * stream, and it is the worse trade twice over: the visible
+             * symptom becomes "the gateway did not come up", which points at
+             * the encoder when the cause is a peripheral nobody asked about.
+             *
+             * So: stream on, overlay off. osd_source stays zeroed and every
+             * consumer of it is guarded, so this is byte for byte the path
+             * taken with no --osd at all.
+             *
+             * Not silent: scripts/verify-imu.sh fails a run that prints no OSD
+             * counters, so a verification run cannot pass on a dead part.
+             * Loud here and fatal there is the right way round - the board has
+             * to keep streaming, the bench has to notice.
+             */
             if (mpu6050_source_open(&imu_config, &osd_imu) == -1) {
-                fprintf(stderr, "Failed to open the MPU6050 sensor: %s\n",
+                fprintf(stderr,
+                        "OSD: IMU unavailable (%s); continuing without the "
+                        "overlay\n",
                         strerror(errno));
-                goto cleanup;
-            }
-            osd_source = mpu6050_sensor_source(osd_imu);
+                source_ready = false;
+            } else {
+                osd_source = mpu6050_sensor_source(osd_imu);
 
-            /*
-             * Which part this is, printed rather than enforced: the module on
-             * this bench answers 0x70, and a log line saying so is worth more
-             * than a driver that would have refused it.
-             */
-            /*
-             * Two different rates, and mixing them up is how the frame rate
-             * cost gets misread: the part samples itself at 100 Hz, but the
-             * bus is only read every imu_interval_us. The second number is
-             * the one that costs frame time.
-             */
-            fprintf(stderr,
-                    "OSD: IMU attached, WHO_AM_I=0x%02X (%s), part at 100 Hz, "
-                    "bus read every %llu ms\n",
-                    (unsigned)mpu6050_source_who_am_i(osd_imu),
-                    mpu6050_who_am_i_name(mpu6050_source_who_am_i(osd_imu))
-                        ? mpu6050_who_am_i_name(
-                              mpu6050_source_who_am_i(osd_imu))
-                        : "unrecognised",
-                    (unsigned long long)(imu_interval_us / 1000ULL));
+                /*
+                 * Which part this is, printed rather than enforced: the module
+                 * on this bench answers 0x70, and a log line saying so is worth
+                 * more than a driver that would have refused it.
+                 */
+                /*
+                 * Two different rates, and mixing them up is how the frame rate
+                 * cost gets misread: the part samples itself at 100 Hz, but the
+                 * bus is only read every imu_interval_us. The second number is
+                 * the one that costs frame time.
+                 */
+                fprintf(stderr,
+                        "OSD: IMU attached, WHO_AM_I=0x%02X (%s), part at "
+                        "100 Hz, bus read every %llu ms\n",
+                        (unsigned)mpu6050_source_who_am_i(osd_imu),
+                        mpu6050_who_am_i_name(mpu6050_source_who_am_i(osd_imu))
+                            ? mpu6050_who_am_i_name(
+                                  mpu6050_source_who_am_i(osd_imu))
+                            : "unrecognised",
+                        (unsigned long long)(imu_interval_us / 1000ULL));
+            }
         } else {
             struct mock_sensor_config osd_config;
             struct mock_sensor *osd_sensor = NULL;
@@ -920,54 +950,64 @@ int main(int argc, char **argv)
             osd_source = mock_sensor_source(osd_sensor);
         }
 
-        if (osd_feed_open(NULL, &osd_source, &feed) == -1) {
-            fprintf(stderr, "Failed to open the OSD feed\n");
-            goto cleanup;
-        }
-
-        memset(&telemetry_config, 0, sizeof(telemetry_config));
-        telemetry_config.panel = true;
         /*
-         * Knockout, so the letters are cut out of a light panel. Over live
-         * video this is the readable choice regardless of what the camera is
-         * pointed at; plain light text would vanish against a bright scene.
+         * Everything below needs a source. When there is none the annotator is
+         * left NULL, and both encode loops test it before calling the feed, so
+         * the result is the un-annotated pipeline rather than an overlay
+         * showing numbers nobody measured.
          */
-        telemetry_config.knockout = true;
-        telemetry_config.panel_padding = ENC_OSD_PADDING;
-        telemetry_config.origin_x = ENC_OSD_ORIGIN_X;
-        telemetry_config.origin_y = ENC_OSD_ORIGIN_Y;
+        if (source_ready) {
+            if (osd_feed_open(NULL, &osd_source, &feed) == -1) {
+                fprintf(stderr, "Failed to open the OSD feed\n");
+                goto cleanup;
+            }
 
-        if (osd_telemetry_open(&telemetry_config, &telemetry) == -1) {
-            fprintf(stderr, "Failed to open the OSD overlay\n");
-            goto cleanup;
-        }
-
-        memset(&annotate_config, 0, sizeof(annotate_config));
-        annotate_config.width = actual_width;
-        annotate_config.height = actual_height;
-
-        if (osd_annotate_open(&annotate_config, telemetry, &annotator) == -1) {
+            memset(&telemetry_config, 0, sizeof(telemetry_config));
+            telemetry_config.panel = true;
             /*
-             * The annotator owns the telemetry from here on its success path; on
-             * failure it did not take it, so it is cleared to avoid a double
-             * free at cleanup.
+             * Knockout, so the letters are cut out of a light panel. Over live
+             * video this is the readable choice regardless of what the camera
+             * is pointed at; plain light text would vanish against a bright
+             * scene.
              */
-            fprintf(stderr, "Failed to open the frame annotator\n");
-            osd_telemetry_destroy(telemetry);
+            telemetry_config.knockout = true;
+            telemetry_config.panel_padding = ENC_OSD_PADDING;
+            telemetry_config.origin_x = ENC_OSD_ORIGIN_X;
+            telemetry_config.origin_y = ENC_OSD_ORIGIN_Y;
+
+            if (osd_telemetry_open(&telemetry_config, &telemetry) == -1) {
+                fprintf(stderr, "Failed to open the OSD overlay\n");
+                goto cleanup;
+            }
+
+            memset(&annotate_config, 0, sizeof(annotate_config));
+            annotate_config.width = actual_width;
+            annotate_config.height = actual_height;
+
+            if (osd_annotate_open(&annotate_config, telemetry, &annotator)
+                == -1) {
+                /*
+                 * The annotator owns the telemetry from here on its success
+                 * path; on failure it did not take it, so it is cleared to
+                 * avoid a double free at cleanup.
+                 */
+                fprintf(stderr, "Failed to open the frame annotator\n");
+                osd_telemetry_destroy(telemetry);
+                telemetry = NULL;
+                goto cleanup;
+            }
+
+            /*
+             * Handed over: the annotator destroys it. Clearing the local copy
+             * is what keeps cleanup from freeing it a second time.
+             */
             telemetry = NULL;
-            goto cleanup;
+
+            fprintf(stderr, "OSD: on, source=%s mode=%s, %ux%u at (%u,%u)\n",
+                    options.osd_source, options.osd_mode, actual_width,
+                    actual_height, (unsigned)ENC_OSD_ORIGIN_X,
+                    (unsigned)ENC_OSD_ORIGIN_Y);
         }
-
-        /*
-         * Handed over: the annotator destroys it. Clearing the local copy is
-         * what keeps cleanup from freeing it a second time.
-         */
-        telemetry = NULL;
-
-        fprintf(stderr, "OSD: on, source=%s mode=%s, %ux%u at (%u,%u)\n",
-                options.osd_source, options.osd_mode, actual_width,
-                actual_height, (unsigned)ENC_OSD_ORIGIN_X,
-                (unsigned)ENC_OSD_ORIGIN_Y);
     }
 
     memset(&encoder_config, 0, sizeof(encoder_config));
