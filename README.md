@@ -146,6 +146,10 @@ MPU6050(bit-bang I²C) / Mock Sensor -> Sensor RingBuffer -> Sensor Attitude
 │   ├── verify-mpu6050.sh     MPU6050 驱动验证
 │   ├── imu-soak.sh           带真实 IMU 的长稳（不依赖 imu-sample）
 │   ├── netdrop.sh            板端：把 RNDIS 网口捅掉 N 秒再拉起（网络中断/恢复验证）
+│   ├── frame-arrival.py      客户端：逐帧到达时间戳（延迟测量主力）
+│   ├── first-frame-stats.py  客户端：首帧等待的分布（**必须打散相位**）
+│   ├── client-timeline.py    客户端：给 ffmpeg 的 RTSP 各步打时间戳
+│   ├── measure-latency.sh    板上 GOP 扫描（**有 ISP 卡死风险，默认拒绝多档**）
 │   ├── start-2h-soak.sh      长稳（2h/8h）
 │   ├── fps-osd-compare.sh    同场次帧率对照/扫描
 │   ├── soak-monitor.sh       资源采样到 /userdata/soak.csv
@@ -543,7 +547,7 @@ VLC / ffplay 可以打开 rtsp://172.32.0.93:8554/live/0
 [x] OSD + 真实 IMU 并入默认生产配置（gateway.env，30 分钟长稳）
 [x] 冷启动（上电 → 3A 首次收敛）完整验证 —— 已做（含物理断电重启），并发现+修复严重缺陷
 [x] 网络断开/恢复专项测试 —— 已做：网口捅掉 20s，网关不崩不泄漏、可重连
-[ ] 端到端延迟的正式测量（目前只有 ffplay ~0.75s 粗测）
+[x] 端到端延迟的正式测量 —— 网关侧稳态 ≲50ms；新观众首帧等待 1.12~2.12s（原「0.75s」作废）
 [ ] 架构图与演示视频
 
 更新版本的清单（含每项证据）见 `docs/agent-handoff.md`。

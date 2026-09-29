@@ -49,3 +49,6 @@ datasheets/
 # Frame grabs from the "is the overlay actually live" spot check: two PNGs
 # pulled straight off the RTSP stream. Evidence for one session, not an asset.
 /.healthcheck/
+
+# Working directory of scripts/measure-latency.sh (arrival logs).
+/.latency/
