@@ -129,6 +129,7 @@ MPU6050(bit-bang I²C) / Mock Sensor -> Sensor RingBuffer -> Sensor Attitude
 ├── README.md
 ├── docs/
 │   ├── agent-handoff.md      ★ 最新交接文档（现状以此为准）
+│   ├── architecture.html     ★ 架构图（自包含，双击即开）
 │   ├── status.md             实测数据与根因分析
 │   ├── handoff.md            历史快照（写于 RTSP 阶段，已标注）
 │   ├── roadmap.md            阶段规划
@@ -521,6 +522,12 @@ docs/handoff.md         历史快照（写于 RTSP 阶段，已在文首标注�
 docs/status.md
 ```
 
+架构图（自包含 HTML，直接用浏览器打开）：
+
+```text
+docs/architecture.html
+```
+
 已完成的 RTSP 验收目标：
 
 ```text
@@ -548,7 +555,8 @@ VLC / ffplay 可以打开 rtsp://172.32.0.93:8554/live/0
 [x] 冷启动（上电 → 3A 首次收敛）完整验证 —— 已做（含物理断电重启），并发现+修复严重缺陷
 [x] 网络断开/恢复专项测试 —— 已做：网口捅掉 20s，网关不崩不泄漏、可重连
 [x] 端到端延迟的正式测量 —— 网关侧稳态 ≲50ms；新观众首帧等待 1.12~2.12s（原「0.75s」作废）
-[ ] 架构图与演示视频
+[x] 架构图 —— `docs/architecture.html`（自包含 HTML，按代码实际结构绘制）
+[ ] 演示视频
 
 更新版本的清单（含每项证据）见 `docs/agent-handoff.md`。
 ```

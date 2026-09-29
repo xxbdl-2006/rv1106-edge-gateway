@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RV1106 Edge Gateway 架构图</title>
+<style>
+  :root{
+    --bg:#f5f6f8;
+    --panel:#ffffff;
+    --panel-2:#fbfcfd;
+    --line:#e3e7ed;
+    --line-strong:#cfd6e0;
+    --ink:#1c2128;
+    --ink-2:#454d59;
+    --ink-3:#7b8494;
+    --video:#2563eb;
+    --video-bg:#eef4ff;
+    --sensor:#b45309;
+    --sensor-bg:#fdf6ec;
+    --net:#0f766e;
+    --net-bg:#e9f7f5;
+    --svc:#5b6478;
+    --svc-bg:#f2f4f7;
+    --red:#c02626;
+    --red-bg:#fdf0f0;
+    --ok:#15803d;
+    --ok-bg:#eef8f1;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg);color:var(--ink);font-family:var(--sans);
+    font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased;
+    padding:0 0 64px;
+  }
+  .wrap{max-width:1240px;margin:0 auto;padding:0 24px}
+
+  /* ---------- header ---------- */
+  header{
+    background:linear-gradient(180deg,#ffffff 0%,#fafbfc 100%);
+    border-bottom:1px solid var(--line);
+    padding:30px 0 24px;margin-bottom:24px;
+  }
+  h1{font-size:23px;margin:0 0 6px;letter-spacing:-.2px;font-weight:650}
+  .sub{color:var(--ink-3);font-size:13px;margin:0}
+  .facts{
+    display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+    gap:10px;margin-top:20px;
+  }
+  .fact{
+    background:var(--panel);border:1px solid var(--line);border-radius:9px;
+    padding:10px 13px;
+  }
+  .fact .k{font-size:11px;color:var(--ink-3);letter-spacing:.02em}
+  .fact .v{font-family:var(--mono);font-size:15px;font-weight:600;color:var(--ink);margin-top:2px}
+  .fact .v small{font-family:var(--sans);font-weight:400;font-size:11px;color:var(--ink-3)}
+
+  /* ---------- section ---------- */
+  section{margin:0 0 34px}
+  .sec-head{display:flex;align-items:baseline;gap:10px;margin:0 0 4px}
+  .sec-num{
+    font-family:var(--mono);font-size:11px;font-weight:700;color:#fff;
+    background:var(--ink);border-radius:5px;padding:2px 7px;flex:none;
+  }
+  h2{font-size:16px;margin:0;font-weight:640;letter-spacing:-.1px}
+  .sec-note{color:var(--ink-3);font-size:12.5px;margin:0 0 15px}
+
+  /* ---------- flow canvas ---------- */
+  .flow{
+    position:relative;background:var(--panel);border:1px solid var(--line);
+    border-radius:13px;padding:22px 20px;
+  }
+  .flow + .flow{margin-top:14px}
+  .flow.gap-top{margin-top:46px}
+  .lane-label{
+    position:absolute;top:-1px;left:20px;transform:translateY(-50%);
+    background:var(--panel);padding:0 9px;font-size:11.5px;font-weight:650;
+    letter-spacing:.03em;display:flex;align-items:center;gap:7px;
+  }
+  /* flow-root keeps the first flow's top margin inside the wrapper, so the
+     absolutely positioned wire layer covers the same box the cards live in. */
+  .flow-wrap{position:relative;display:flow-root}
+  svg[id^="wires"]{position:absolute;top:0;left:0;pointer-events:none;z-index:3;overflow:visible}
+  .flow{position:relative;z-index:1}
+
+  .row{display:flex;align-items:stretch;gap:0;position:relative;z-index:2}
+  .row + .row{margin-top:20px}
+  .row.wrap{flex-wrap:wrap;gap:14px}
+  /* extra room under the video lane so the sensor->OSD wire has a visible path */
+  .flow.inject-gap{margin-top:38px}
+
+  /* ---------- cards ---------- */
+  .card{
+    flex:1 1 0;min-width:0;background:var(--panel-2);
+    border:1px solid var(--line-strong);border-radius:10px;
+    padding:11px 12px;position:relative;transition:.16s ease;
+  }
+  .card.tight{flex:0 0 auto;min-width:118px}
+  .card:hover{border-color:var(--ink-3);box-shadow:0 3px 12px rgba(20,28,40,.09);transform:translateY(-1px)}
+  .card .t{font-weight:620;font-size:13px;letter-spacing:-.05px;display:flex;align-items:center;gap:6px}
+  .card .f{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:4px;word-break:break-all}
+  .card .d{font-size:11.5px;color:var(--ink-2);margin-top:5px;line-height:1.45}
+  .card .tag{
+    display:inline-block;font-size:10px;font-family:var(--mono);padding:1px 5px;
+    border-radius:4px;background:var(--svc-bg);color:var(--svc);border:1px solid var(--line);
+  }
+
+  .cv{border-color:#c3d5f8;background:var(--video-bg)}
+  .cv .t{color:#1d4ed8}
+  .cv .f{color:#5b7fc7}
+  .cs{border-color:#f0d6ab;background:var(--sensor-bg)}
+  .cs .t{color:#96520a}
+  .cs .f{color:#b07a3a}
+  .cn{border-color:#a9d9d1;background:var(--net-bg)}
+  .cn .t{color:#0d6a63}
+  .cn .f{color:#4a8f88}
+  .cg{border-color:var(--line-strong);background:var(--svc-bg)}
+  .cg .t{color:var(--svc)}
+
+  .card.hero{border-width:2px;border-color:#f0b429;background:#fffdf3;box-shadow:0 0 0 3px rgba(240,180,41,.12)}
+  .card.hero .t{color:#8a5a00}
+  .inject-badge{
+    position:absolute;top:-11px;right:9px;background:#b45309;color:#fff;
+    font-size:9.5px;font-weight:650;padding:2px 7px;border-radius:20px;
+    letter-spacing:.04em;white-space:nowrap;
+  }
+  .card.ghost{
+    border-style:dashed;background:transparent;opacity:.72;
+  }
+  .card.ghost .t{color:var(--ink-3)}
+
+  /* ---------- pool (threads) ---------- */
+  .pool{
+    border:1px dashed var(--line-strong);border-radius:11px;padding:13px;background:var(--panel-2);
+  }
+  .pool-head{font-size:11.5px;font-weight:650;color:var(--svc);margin-bottom:10px;letter-spacing:.03em}
+  .chips{display:flex;flex-wrap:wrap;gap:7px}
+  .chip{
+    font-size:11.5px;border:1px solid var(--line-strong);background:#fff;
+    border-radius:7px;padding:5px 9px;line-height:1.35;
+  }
+  .chip b{font-weight:640}
+  .chip .n{font-family:var(--mono);font-size:10.5px;color:var(--ink-3)}
+
+  /* ---------- notes ---------- */
+  .note{
+    border-left:3px solid var(--line-strong);padding:9px 0 9px 13px;
+    color:var(--ink-2);font-size:12.5px;margin-top:14px;background:linear-gradient(90deg,rgba(0,0,0,.014),transparent);
+  }
+  .note.warn{border-left-color:#d97706}
+  .note.bad{border-left-color:var(--red)}
+  .note.good{border-left-color:var(--ok)}
+  .note b{color:var(--ink)}
+  .note code{font-family:var(--mono);font-size:11.5px;background:#f0f2f5;padding:1px 4px;border-radius:3px}
+
+  /* ---------- red lines ---------- */
+  .rules{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:11px}
+  .rule{
+    background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--red);
+    border-radius:8px;padding:11px 13px;
+  }
+  .rule .h{font-weight:640;font-size:12.5px;color:#8f1d1d;margin-bottom:3px}
+  .rule .b{font-size:12px;color:var(--ink-2);line-height:1.55}
+  .rule code{font-family:var(--mono);font-size:11px;background:#f0f2f5;padding:1px 4px;border-radius:3px}
+
+  /* ---------- table ---------- */
+  table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);font-size:12.5px;vertical-align:top}
+  th{background:var(--panel-2);font-weight:640;color:var(--ink-2);font-size:11.5px;letter-spacing:.02em}
+  tr:last-child td{border-bottom:none}
+  td.num{font-family:var(--mono);white-space:nowrap;font-weight:600}
+  td.dim{color:var(--ink-3)}
+
+  /* ---------- tooltip ---------- */
+  #tip{
+    position:fixed;z-index:99;max-width:330px;background:#1c2128;color:#eef1f5;
+    font-size:11.5px;line-height:1.5;padding:8px 11px;border-radius:7px;
+    pointer-events:none;opacity:0;transition:opacity .12s;box-shadow:0 6px 22px rgba(10,14,20,.3);
+  }
+  #tip.on{opacity:1}
+  #tip b{color:#fff}
+  #tip code{font-family:var(--mono);color:#9fd0ff}
+
+  footer{color:var(--ink-3);font-size:11.5px;margin-top:34px;padding-top:16px;border-top:1px solid var(--line)}
+  footer code{font-family:var(--mono);font-size:11px}
+
+  .legend{display:flex;flex-wrap:wrap;gap:14px;margin:0 0 14px;font-size:11.5px;color:var(--ink-2)}
+  .legend span{display:flex;align-items:center;gap:6px}
+  .sw{width:11px;height:11px;border-radius:3px;border:1px solid}
+  .sw.v{background:var(--video-bg);border-color:#c3d5f8}
+  .sw.s{background:var(--sensor-bg);border-color:#f0d6ab}
+  .sw.n{background:var(--net-bg);border-color:#a9d9d1}
+  .sw.g{background:var(--svc-bg);border-color:var(--line-strong)}
+  .sw.h{background:#fffdf3;border-color:#f0b429}
+
+  @media print{
+    body{background:#fff;padding:0}
+    .card:hover{transform:none;box-shadow:none}
+    section{break-inside:avoid}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <h1>RV1106 Edge Gateway 架构图</h1>
+    <p class="sub">
+      Luckfox Pico Pro/Max（RV1106G）· 摄像头 → V4L2 → Rockit MPI H.264 → RTSP over TCP，
+      外加一条「真实 MPU6500 → OSD 叠加」的支线 · 本图按 <b>代码实际结构</b>绘制
+    </p>
+    <div class="facts">
+      <div class="fact"><div class="k">对外流</div><div class="v" style="font-size:12.5px">rtsp://172.32.0.93:8554/live/0</div></div>
+      <div class="fact"><div class="k">视频</div><div class="v">1280×720 <small>H.264 / 30fps</small></div></div>
+      <div class="fact"><div class="k">稳态管线延迟</div><div class="v" style="color:var(--ok)">≲ 50 ms</div></div>
+      <div class="fact"><div class="k">新观众首帧</div><div class="v" style="color:#b45309">1.12–2.12 s</div></div>
+      <div class="fact"><div class="k">冷启动出流</div><div class="v">≈ 19 s</div></div>
+      <div class="fact"><div class="k">常驻资源</div><div class="v">fds 28 <small>/ threads 6</small></div></div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="legend">
+    <span><i class="sw v"></i>视频主线</span>
+    <span><i class="sw s"></i>传感器支线</span>
+    <span><i class="sw n"></i>网络 / 协议</span>
+    <span><i class="sw g"></i>进程与服务</span>
+    <span><i class="sw h"></i>两条线的唯一交汇点</span>
+  </div>
+
+  <!-- ================= 0. 总览 ================= -->
+  <section>
+    <div class="sec-head"><span class="sec-num">01</span><h2>运行时总览</h2></div>
+    <p class="sec-note">两条流水线在进程内并行，<b>只在一处相交</b>：OSD 合成。传感器不进视频队列，视频也不等传感器。</p>
+
+    <div class="flow-wrap" id="host-overview">
+      <svg id="wires-overview"></svg>
+
+      <div class="flow gap-top" id="ov-video">
+        <div class="lane-label" style="color:#1d4ed8">视频主线</div>
+        <div class="row">
+          <div class="card cv" id="ov-v1" data-tip="<b>摄像头 / V4L2</b><br><code>/dev/video11</code><br>MPLANE mmap 取 1280×720 NV12。三步：DQBUF → 紧致化 → QBUF。">
+            <div class="t">V4L2 采集</div><div class="f">v4l2_capture.c</div>
+            <div class="d">/dev/video11 · NV12</div>
+          </div>
+          <div class="card cv" id="ov-v2" data-tip="<b>Frame Ring</b>（仅 <code>--threads</code>）<br><code>frame_ring.c</code> + <code>capture_thread.c</code><br>4 槽有界环，创建期一次性分配；push 永不阻塞，满则覆盖最旧帧。借出的缓冲是 <b>const</b>。">
+            <div class="t">Frame Ring</div><div class="f">frame_ring.c</div>
+            <div class="d">4 槽 · 覆盖最旧</div>
+          </div>
+          <div class="card cv hero" id="ov-v3" data-tip="<b>OSD 合成</b><br><code>osd_annotate.c</code><br>在 <b>私有副本</b>上合成（借出的帧是 const，不能就地涂改）。放不下就拒绝，不裁剪。">
+            <div class="inject-badge">传感器在此注入</div>
+            <div class="t">OSD 合成</div><div class="f">osd_annotate.c</div>
+            <div class="d">私有副本 · 拒绝而非裁剪</div>
+          </div>
+          <div class="card cv" id="ov-v4" data-tip="<b>H.264 编码</b><br><code>mpp_encoder.c</code><br>Rockit MPI VENC，Baseline / CBR 2 Mbps。每帧约 12 ms。">
+            <div class="t">H.264 编码</div><div class="f">mpp_encoder.c</div>
+            <div class="d">Rockit MPI · CBR 2M</div>
+          </div>
+          <div class="card cn" id="ov-v5" data-tip="<b>Packet Sink / 队列</b><br><code>sink_queue.c</code> + <code>packet_queue.c</code><br>有界队列，溢出时丢 <b>整个最旧 GOP</b>（不丢半个，否则观众花屏）。">
+            <div class="t">Packet 队列</div><div class="f">sink_queue.c</div>
+            <div class="d">丢最旧整个 GOP</div>
+          </div>
+          <div class="card cn" id="ov-v6" data-tip="<b>RTSP over TCP</b><br><code>rtsp_server.c</code>（唯一持有 socket 的文件）<br>RTP 打包在 <code>rtp_h264.c</code>，协议/SDP 在 <code>rtsp_proto.c</code>。最多 4 路客户端。">
+            <div class="t">RTSP / RTP</div><div class="f">rtsp_server.c</div>
+            <div class="d">TCP 交织 · ≤4 客户端</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="flow inject-gap" id="ov-sensor">
+        <div class="lane-label" style="color:#96520a">传感器支线</div>
+        <div class="row">
+          <div class="card cs" id="ov-s1" data-tip="<b>MPU6500（料号）</b><br>寄存器布局同 MPU6050。<code>WHO_AM_I = 0x70</code>（不是 0x68）。<br>接线：排针 <b>pin 14 (SDA) / pin 24 (SCL)</b>，gpio70/71。">
+            <div class="t">MPU6500 硬件</div><div class="f">0x68 地址</div>
+            <div class="d">pin14 SDA · pin24 SCL</div>
+          </div>
+          <div class="card cs" id="ov-s2" data-tip="<b>sysfs GPIO 位翻转</b><br><code>gpio_sysfs.c</code> + <code>i2c_bitbang.c</code><br>运行时 device-tree overlay 在这块板上是坏的，所以用软件 bit-bang。一次 14 字节突发实测 <b>≈28 ms</b>（总线约 5 kHz）。">
+            <div class="t">bit-bang I²C</div><div class="f">gpio_sysfs.c</div>
+            <div class="d">gpio70/71 · 28 ms/突发</div>
+          </div>
+          <div class="card cs" id="ov-s3" data-tip="<b>MPU6050 驱动</b><br><code>mpu6050.c</code> + <code>mpu6050_i2c.c</code><br>寄存器编解码 + 标定。校准常数固化在 <code>mpu6050.h</code>，别手工抄第二份。">
+            <div class="t">驱动 / 标定</div><div class="f">mpu6050.c</div>
+            <div class="d">寄存器解码 · ±2g/250dps</div>
+          </div>
+          <div class="card cs" id="ov-s4" data-tip="<b>数据源适配器</b><br><code>mpu6050_source.c</code><br>实现 <code>sensor_source</code> 接口，把驱动包装成可替换的数据源（mock 走同一个接口）。">
+            <div class="t">sensor_source</div><div class="f">mpu6050_source.c</div>
+            <div class="d">接口适配 · 与 mock 同形</div>
+          </div>
+          <div class="card cs" id="ov-s5" data-tip="<b>采样节奏层</b><br><code>osd_feed.c</code><br>按 <b>自己的</b>周期（默认 100 ms）轮询传感器，<b>不是每帧读</b>——否则一次慢 I²C 就会变成丢视频帧。读失败时保留上一个好样本并标记 stale。">
+            <div class="t">osd_feed</div><div class="f">osd_feed.c</div>
+            <div class="d">100 ms 轮询 · 保留最后好样本</div>
+          </div>
+          <div class="card cs" id="ov-s6" data-tip="<b>遥测渲染</b><br><code>osd_telemetry.c</code> + <code>format</code> + <code>font</code> + <code>overlay</code><br>姿态解算（无 libm）→ 定点文本 → 1bpp 画布。无样本打印 <code>--</code>，绝不打印 <code>0.0</code>。">
+            <div class="t">遥测 / 画布</div><div class="f">osd_telemetry.c</div>
+            <div class="d">1bpp 画布 · 内嵌点阵字体</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="note good">
+      <b>为什么这两条线只在 OSD 相交：</b>传感器支线走自己的采样周期，视频支线走帧周期。
+      <code>frame_ring</code> 借出的缓冲是 <code>const</code>，所以 OSD 必须在私有副本上合成 ——
+      这条契约同时保证了「传感器慢」不会变成「视频丢帧」。
+    </div>
+  </section>
+
+  <!-- ================= 2. 视频主线详情 ================= -->
+  <section>
+    <div class="sec-head"><span class="sec-num">02</span><h2>视频主线 · 线程模型</h2></div>
+    <p class="sec-note">生产配置 <code style="font-family:var(--mono);font-size:11.5px">--threads --osd --osd-source mpu6050</code> 下，进程内共 6 个线程。</p>
+
+    <div class="flow-wrap" id="host-threads">
+      <svg id="wires-threads"></svg>
+
+      <div class="flow gap-top">
+        <div class="lane-label" style="color:var(--svc)">进程 v4l2_mpp_encode</div>
+
+        <div class="row">
+          <div class="card cv" id="th-cap" data-tip="<b>采集线程</b>（<code>--threads</code> 才独立）<br><code>capture_thread.c</code><br>V4L2 DQBUF → 紧致化 NV12 → <code>frame_ring_push</code>。同步模式下这一步并回主线程。">
+            <div class="t">① 采集线程</div><div class="f">capture_thread.c</div>
+            <div class="d">DQBUF → 紧致化 → push</div>
+          </div>
+          <div class="card cv" id="th-enc" data-tip="<b>主线程</b><br><code>v4l2_mpp_encode.c</code><br><code>frame_ring_acquire</code> → <code>osd_feed_next</code>（按 100 ms 周期真正读 IMU）→ <code>osd_annotate_apply</code> → 编码 → 推入 packet 队列。">
+            <div class="t">② 主线程</div><div class="f">v4l2_mpp_encode.c</div>
+            <div class="d">acquire → 叠加 → 编码 → 入队</div>
+          </div>
+          <div class="card cn" id="th-reader" data-tip="<b>reader 线程 —— 队列的唯一消费者</b><br><code>rtsp_server.c</code><br>把每个帧<b>只打包一次</b> RTP，再扇出给所有客户端。若改成「每个客户端各自取队列」，帧会被瓜分 → 全员花屏。无人观看时也继续消费，保证编码器不被阻塞。">
+            <div class="t">③ RTSP reader</div><div class="f">rtsp_server.c :337</div>
+            <div class="d">唯一消费者 · 打包一次后扇出</div>
+          </div>
+          <div class="card cn" id="th-listen" data-tip="<b>listener 线程</b><br><code>rtsp_server.c :918</code><br>accept 新连接 + 回收已结束的会话。">
+            <div class="t">④ RTSP listener</div><div class="f">rtsp_server.c :918</div>
+            <div class="d">accept + 回收会话</div>
+          </div>
+          <div class="card cn" id="th-client" data-tip="<b>client 线程 × N</b>（≤4）<br><code>rtsp_server.c :807</code><br>每连接一个，只做请求/响应（OPTIONS / DESCRIBE / SETUP / PLAY / TEARDOWN）。<b>handler 不得持锁调用</b> <code>client_send_response()</code>，否则死锁。">
+            <div class="t">⑤ client ×N</div><div class="f">rtsp_server.c :807</div>
+            <div class="d">每连接一个 · 只做请求响应</div>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:16px">
+          <div class="card ghost" id="th-sync" data-tip="<b>同步模式（默认，无 --threads）</b><br>采集与编码在同一个循环里串行执行。历史基线路径，8 小时长稳走的是线程化那条。">
+            <div class="t">同步模式（默认）</div><div class="f">采集 + 编码合并主循环</div>
+            <div class="d">上一代基线；线程化后为 <code class="tag">--threads</code> 显式开关</div>
+          </div>
+          <div class="card ghost" id="th-sinkfile" data-tip="<b>其它 sink</b><br><code>sink_file.c</code>：写 Annex-B 文件。<code>verify-imu.sh</code> / <code>fps-osd-compare.sh</code> 用它，因为它们要把帧拿回来自己看。">
+            <div class="t">其他 Sink</div><div class="f">sink_file.c · sink_queue.c</div>
+            <div class="d">file / queue / rtsp 三种，接口在 <code class="tag">packet_sink.h</code></div>
+          </div>
+        </div>
+
+        <div class="note">
+          <b>为什么 reader 必须是单消费者：</b>RTP 的序列号与时间戳描述的是<b>这条流</b>，不是<b>这个连接</b>。
+          若每个客户端各自从队列取，同一帧会被分给不同的人，谁都拼不齐。
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 3. 服务层 ================= -->
+  <section>
+    <div class="sec-head"><span class="sec-num">03</span><h2>进程与服务层 · 开机与接管</h2></div>
+    <p class="sec-note">上电 → 出流约 19 秒。其中一半时间花在等厂商启动链把 rkipc 放出来（这是必须付的代价）。</p>
+
+    <div class="flow-wrap" id="host-svc">
+      <svg id="wires-svc"></svg>
+
+      <div class="flow gap-top">
+        <div class="lane-label" style="color:var(--svc)">开机链路</div>
+        <div class="row">
+          <div class="card cg" id="sv-1" data-tip="<b>init.d 启动脚本</b><br><code>scripts/S99gateway</code><br>负责「接管」：等 /userdata 挂载 → 等 <code>/dev/video11</code> 节点（30 s）→ 确认持有者 → 杀 rkipc → 拉起 <code>rkaiq_3A_server</code> → 交给 supervisor。">
+            <div class="t">S99gateway</div><div class="f">scripts/S99gateway</div>
+            <div class="d">接管编排 · 开机 ~6 s 起跑</div>
+          </div>
+          <div class="card cg" id="sv-2" data-tip="<b>看门狗</b><br><code>scripts/gateway-supervise.sh</code><br>读 <code>gateway.env</code>，拉起并监督 worker；退出即重启（5 s）。">
+            <div class="t">gateway-supervise.sh</div><div class="f">scripts/gateway-supervise.sh</div>
+            <div class="d">看门狗 · 退出即重启</div>
+          </div>
+          <div class="card cv" id="sv-3" data-tip="<b>worker</b><br><code>/userdata/v4l2_mpp_encode</code><br>真正的网关进程。健康基线：fds 28（=24 + 2 引脚×2）、threads 6、CPU 32%、55.9 °C。">
+            <div class="t">v4l2_mpp_encode</div><div class="f">worker 进程</div>
+            <div class="d">fds 28 · threads 6 · CPU 32%</div>
+          </div>
+        </div>
+        <div class="row" style="margin-top:14px">
+          <div class="card cg" id="sv-4" data-tip="<b>配置单一来源</b><br><code>scripts/gateway.env</code> → 由安装脚本推到板上 <code>/userdata/gateway.env</code>。<br><b>不要在板上直接改</b>——重装会静默覆盖。改配置 = 改仓库那份 + 重装 + restart。">
+            <div class="t">gateway.env</div><div class="f">scripts/gateway.env</div>
+            <div class="d">单一来源 · 装到 /userdata</div>
+          </div>
+          <div class="card cg" id="sv-5" data-tip="<b>ISP / 3A</b><br><code>/oem/usr/bin/rkaiq_3A_server</code><br>由接管流程启动，负责自动曝光/自动白平衡收敛。未收敛时采集只有 25 fps（不是缺陷，是 ISP 还没稳）。">
+            <div class="t">rkaiq_3A_server</div><div class="f">/oem/usr/bin/</div>
+            <div class="d">ISP 收敛 · 由接管启动</div>
+          </div>
+          <div class="card cg" id="sv-6" data-tip="<b>厂商推流进程</b><br><code>rkipc</code><br>由 <code>RkLunch.sh</code> 的 <code>post_chk &amp;</code> 后台拉起，约占 <code>/dev/video11</code>。<b>接管时必须杀掉它。</b>它不是 init.d 起的，所以「禁用它 init 脚本」是空操作。">
+            <div class="t">rkipc（厂商）</div><div class="f">RkLunch.sh 后台拉起</div>
+            <div class="d">接管时杀掉 · 与网关争摄像头</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="note warn">
+      <b>接管判据 = 等 <code>/dev/video11</code> 节点出现</b>，不是等 rkipc 进程。
+      <code>RkLunch.sh</code> 最后一行是 <code>post_chk &amp;</code>（后台），rkipc 是其最后一步 ——
+      所以「现在没有 rkipc」≠「rkipc 不会来」。S99gateway 与 rkipc 之间有约 <b>1.5 秒</b>的竞态窗口，
+      靠 <code>/proc/uptime</code> 区分「开机」与「重启」来兜住。
+    </div>
+  </section>
+
+  <!-- ================= 4. 红线 ================= -->
+  <section>
+    <div class="sec-head"><span class="sec-num">04</span><h2>架构红线</h2></div>
+    <p class="sec-note">破坏了会引入很难查的 bug —— 这几条是踩过坑换来的。</p>
+    <div class="rules">
+      <div class="rule"><div class="h">① socket 只许出现在一个文件里</div>
+        <div class="b">只有 <code>rtsp_server.c</code> 碰 socket；协议解析在 <code>rtsp_proto.c</code>，RTP 打包在 <code>rtp_h264.c</code>。
+          这样它们都是纯缓冲、无系统依赖，<b>Windows 上才有得测</b>。</div></div>
+      <div class="rule"><div class="h">② 多客户端必须是 reader 单消费者</div>
+        <div class="b">reader 打包一次 → 扇出。别改成「每客户端各自取队列」，那会让帧被瓜分，<b>全员花屏</b>。</div></div>
+      <div class="rule"><div class="h">③ handler 不得持锁调 <code>client_send_response()</code></div>
+        <div class="b">它自己会取 <code>server-&gt;mutex</code>，持锁调用直接死锁。</div></div>
+      <div class="rule"><div class="h">④ 借出的帧缓冲是 <code>const</code></div>
+        <div class="b">不能就地涂改 —— OSD 那条路径之所以合法，正是因为在私有副本上合成。</div></div>
+      <div class="rule"><div class="h">⑤ 主循环禁止会增长的动态分配</div>
+        <div class="b">8 小时长稳的零泄漏就是这么保住的（RSS 钉死）。</div></div>
+      <div class="rule"><div class="h">⑥ <code>SENSOR_SRC</code> 不进 <code>MEDIA_SRC</code></div>
+        <div class="b">传感器与视频流水线刻意<b>零交集</b> —— 两条线只在 OSD 相交。</div></div>
+    </div>
+  </section>
+
+  <!-- ================= 5. 实测数字 ================= -->
+  <section>
+    <div class="sec-head"><span class="sec-num">05</span><h2>实测数据与延迟归属</h2></div>
+    <p class="sec-note">「延迟」是两个数，归属方相反 —— 旧记录里的「ffplay 约 0.75 s」两个都不是，已作废。</p>
+    <table>
+      <thead><tr><th style="width:30%">项</th><th style="width:26%">实测</th><th>归属 / 说明</th></tr></thead>
+      <tbody>
+        <tr><td>稳态管线延迟<br><span class="dim">帧已在流里之后</span></td>
+            <td class="num" style="color:var(--ok)">≲ 50 ms</td>
+            <td><b>网关</b>。两处队列峰值深度均为 1（1020 帧 @ 30.000 fps、零丢帧）→ 排队 ≤ 1 帧 = 33 ms；TCP 建连 19 ms；ping &lt; 1 ms。</td></tr>
+        <tr><td>新观众首帧等待<br><span class="dim">按下 PLAY 到看见画面</span></td>
+            <td class="num" style="color:#b45309">1.12 – 2.12 s<br><span class="dim" style="font-weight:400">中位 ≈ 1.5 s</span></td>
+            <td>前半段<b>网关</b>：<code>joining</code> 门控 —— 等下一个 IDR 才发首包（否则观众拿到花屏）。关键帧间隔实测恰为 <b>1.000 s</b>，故为 0–1 s 抽奖。后半段 ≈ 1.1 s 在<b>客户端</b>，<code>nobuffer</code> 类开关反而更慢。</td></tr>
+        <tr><td>帧间隔</td><td class="num">33.3 ms 均值</td>
+            <td>300 帧 9.000 s，漂移 −1.4 ms → 固定延迟而非累积。p50 21.6 / p95 68.2 ms 是 <b>RTP over TCP 交织</b>（一个 TCP 段带多帧），不是抖动。</td></tr>
+        <tr><td>IMU 轮询间隔</td><td class="num">100 ms</td>
+            <td>一次 14 字节突发实测 <b>≈ 28 ms</b>；30 fps 的每帧预算 33 ms。100 ms 档 → 29.998 fps / 零丢帧；10 ms 档 → 21.4 fps / 丢 122 帧。</td></tr>
+        <tr><td>冷启动到出流</td><td class="num">≈ 19 s</td>
+            <td>接管本身 14 s（含等厂商链 ~4 s）。旧的「11 秒出流」测的是不可靠路径，已作废；旧代码在冷启动下<b>永不</b>出流。</td></tr>
+        <tr><td>8 小时长稳</td><td class="num">864,001 帧</td>
+            <td>30.00 fps · drop 0 · dup 0 · exit 0；fds 24 / threads 6 全程不动，末 2 小时 RSS 增长 0 KB。</td></tr>
+        <tr><td>网络中断 20 s</td><td class="num" style="color:var(--ok)">PASS</td>
+            <td>网关 pid 不变、不泄漏、编码不停；死会话被回收后新客户端可连。<b>代价</b>：原客户端扛不过中断、需重连 —— 这是设计取舍，不是缺陷。</td></tr>
+      </tbody>
+    </table>
+
+    <div class="note bad">
+      <b>不在生产路径上的组件（别以为它在跑）：</b>
+      <code>sensor_ring.c</code> —— 已实现且自测通过，但生产用的是 <code>osd_feed</code> 直接轮询
+      <code>sensor_source</code>，主程序<b>未引用</b> sensor_ring（只有它自己和测试引用）。
+      <code>mock_sensor.c</code> 同理：仅测试与降级用，生产配置明确写着不要为了「保险」换回 mock。
+    </div>
+  </section>
+
+  <footer>
+    <div>生成自仓库实际代码与实测记录 · <code>docs/agent-handoff.md</code> / <code>docs/status.md</code></div>
+    <div style="margin-top:4px">生产命令行 · <code>GATEWAY_ARGS="-d /dev/video11 -w 1280 -H 720 --warmup 30 --sink rtsp --rtsp-port 8554 --threads --ring-slots 4 --quiet --osd --osd-source mpu6050"</code></div>
+  </footer>
+</div>
+
+<div id="tip"></div>
+
+<script>
+(function(){
+  "use strict";
+
+  /* ---------------- tooltip ---------------- */
+  var tip = document.getElementById("tip");
+  document.querySelectorAll("[data-tip]").forEach(function(el){
+    el.addEventListener("mousemove", function(event){
+      tip.innerHTML = el.getAttribute("data-tip");
+      tip.classList.add("on");
+      var pad = 14, w = tip.offsetWidth, h = tip.offsetHeight;
+      var x = event.clientX + pad, y = event.clientY + pad;
+      if (x + w > window.innerWidth - 8)  x = event.clientX - w - pad;
+      if (y + h > window.innerHeight - 8) y = event.clientY - h - pad;
+      tip.style.left = x + "px";
+      tip.style.top  = y + "px";
+    });
+    el.addEventListener("mouseleave", function(){ tip.classList.remove("on"); });
+  });
+
+  /* ---------------- connector routing ---------------- */
+  /*
+   * Cards are laid out by CSS, so their positions are only known after layout.
+   * The wires are therefore computed from getBoundingClientRect() rather than
+   * written as literals, and recomputed on resize. Every diagram here is
+   * left-to-right inside a row plus a few vertical jumps between rows, so an
+   * orthogonal (Manhattan) router is enough and keeps the result readable.
+   */
+  var ARROW = "arrow";
+  var SVG_NS = "http://www.w3.org/2000/svg";
+
+  function anchors(host, id, side){
+    var el = document.getElementById(id);
+    if (!el) return null;
+    var b = el.getBoundingClientRect();
+    var h = host.getBoundingClientRect();
+    var left = b.left - h.left, top = b.top - h.top;
+    switch (side){
+      case "right":  return {x:left + b.width,      y:top + b.height/2, axis:"h", dir: 1};
+      case "left":   return {x:left,                y:top + b.height/2, axis:"h", dir:-1};
+      case "bottom": return {x:left + b.width/2,    y:top + b.height,   axis:"v", dir: 1};
+      case "top":    return {x:left + b.width/2,    y:top,              axis:"v", dir:-1};
+    }
+    return null;
+  }
+
+  function route(a, b){
+    var GAP = 16;
+    var ax = a.x + (a.axis === "h" ? a.dir * GAP : 0);
+    var ay = a.y + (a.axis === "v" ? a.dir * GAP : 0);
+    var bx = b.x + (b.axis === "h" ? b.dir * GAP : 0);
+    var by = b.y + (b.axis === "v" ? b.dir * GAP : 0);
+    var d = "M " + a.x + " " + a.y + " L " + ax + " " + ay;
+    if (a.axis === "h" && b.axis === "h"){
+      var mx = (ax + bx) / 2;
+      d += " L " + mx + " " + ay + " L " + mx + " " + by;
+    } else if (a.axis === "v" && b.axis === "v"){
+      var my = (ay + by) / 2;
+      d += " L " + ax + " " + my + " L " + bx + " " + my;
+    } else if (a.axis === "h"){
+      d += " L " + bx + " " + ay;
+    } else {
+      d += " L " + ax + " " + by;
+    }
+    d += " L " + bx + " " + by + " L " + b.x + " " + b.y;
+    return d;
+  }
+
+  /* Wires are declared as [fromId, fromSide, toId, toSide, kind]. */
+  var DIAGRAMS = [
+    { host:"host-overview", svg:"wires-overview", wires:[
+        ["ov-v1","right","ov-v2","left","video"],
+        ["ov-v2","right","ov-v3","left","video"],
+        ["ov-v3","right","ov-v4","left","video"],
+        ["ov-v4","right","ov-v5","left","video"],
+        ["ov-v5","right","ov-v6","left","net"],
+        ["ov-s1","right","ov-s2","left","sensor"],
+        ["ov-s2","right","ov-s3","left","sensor"],
+        ["ov-s3","right","ov-s4","left","sensor"],
+        ["ov-s4","right","ov-s5","left","sensor"],
+        ["ov-s5","right","ov-s6","left","sensor"],
+        /* the one crossing: sensor telemetry feeds the OSD stage */
+        ["ov-s6","top","ov-v3","bottom","inject"]
+      ]},
+    { host:"host-threads", svg:"wires-threads", wires:[
+        ["th-cap","right","th-enc","left","video"],
+        ["th-enc","right","th-reader","left","net"],
+        ["th-reader","right","th-listen","left","net"],
+        ["th-listen","right","th-client","left","net"],
+        ["th-sync","right","th-sinkfile","left","muted"]
+      ]},
+    { host:"host-svc", svg:"wires-svc", wires:[
+        ["sv-1","right","sv-2","left","svc"],
+        ["sv-2","right","sv-3","left","svc"],
+        ["sv-4","right","sv-5","left","svc"],
+        ["sv-5","right","sv-6","left","svc"],
+        ["sv-2","top","sv-4","bottom","svc"],
+        ["sv-3","top","sv-6","bottom","muted"]
+      ]}
+  ];
+
+  var COLORS = {
+    video:  "#5b8def",
+    sensor: "#d99b3f",
+    net:    "#3fa79b",
+    svc:    "#98a2b3",
+    inject: "#b45309",
+    muted:  "#c8ced8"
+  };
+
+  function draw(){
+    DIAGRAMS.forEach(function(diagram){
+      var host = document.getElementById(diagram.host);
+      var svg  = document.getElementById(diagram.svg);
+      if (!host || !svg) return;
+      var scope = diagram.svg;   /* marker ids must be unique across the page */
+
+      var hb = host.getBoundingClientRect();
+      svg.setAttribute("viewBox", "0 0 " + hb.width + " " + hb.height);
+      svg.setAttribute("width",  hb.width);
+      svg.setAttribute("height", hb.height);
+      svg.setAttribute("preserveAspectRatio", "none");
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+      var defs = document.createElementNS(SVG_NS, "defs");
+      Object.keys(COLORS).forEach(function(kind){
+        var marker = document.createElementNS(SVG_NS, "marker");
+        marker.setAttribute("id", ARROW + "-" + kind + "-" + scope);
+        marker.setAttribute("viewBox", "0 0 10 10");
+        marker.setAttribute("refX", "8");
+        marker.setAttribute("refY", "5");
+        marker.setAttribute("markerWidth", "7");
+        marker.setAttribute("markerHeight", "7");
+        marker.setAttribute("orient", "auto-start-reverse");
+        var head = document.createElementNS(SVG_NS, "path");
+        head.setAttribute("d", "M 0 0 L 10 5 L 0 10 z");
+        head.setAttribute("fill", COLORS[kind]);
+        marker.appendChild(head);
+        defs.appendChild(marker);
+      });
+      svg.appendChild(defs);
+
+      diagram.wires.forEach(function(wire){
+        var a = anchors(host, wire[0], wire[1]);
+        var b = anchors(host, wire[2], wire[3]);
+        if (!a || !b) return;
+        var kind = wire[4];
+        var path = document.createElementNS(SVG_NS, "path");
+        path.setAttribute("d", route(a, b));
+        path.setAttribute("fill", "none");
+        path.setAttribute("stroke", COLORS[kind]);
+        path.setAttribute("stroke-width", kind === "inject" ? "2.2" : "1.7");
+        path.setAttribute("stroke-linejoin", "round");
+        path.setAttribute("stroke-linecap", "round");
+        if (kind === "inject") path.setAttribute("stroke-dasharray", "6 4");
+        path.setAttribute("marker-end", "url(#" + ARROW + "-" + kind + "-" + scope + ")");
+        svg.appendChild(path);
+      });
+    });
+  }
+
+  var pending = null;
+  function schedule(){
+    if (pending) cancelAnimationFrame(pending);
+    pending = requestAnimationFrame(draw);
+  }
+
+  window.addEventListener("resize", schedule);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(schedule);
+  window.addEventListener("load", schedule);
+  schedule();
+  setTimeout(schedule, 120);
+})();
+</script>
+</body>
+</html>

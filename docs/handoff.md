@@ -467,7 +467,9 @@ MppCtxType error 0
   网关侧稳态 **≲50ms**（两个队列 `peak_depth=1`、无漂移），
   新观众首帧等待 **1.12~2.12s**（IDR 门控 0~1s + 客户端地板 ~1.1s）。
   **旧记录的「ffplay 约 0.75s」作废** —— 它两个都不是。
-- **架构图与演示视频未产出**。
+- ✅ **架构图已产出**（2026-09-29）：`docs/architecture.html`，自包含 HTML，
+  按代码实际结构画（含一处纠正：`sensor_ring.c` **不在生产路径上**）。
+- **演示视频未产出**。
 
 **设计上刻意保留的边界**
 
@@ -509,7 +511,8 @@ MppCtxType error 0
 [x] restart 端到端回归 —— PASS，接管 4 秒，零白等
 [x] 网络断开/恢复专项测试 —— PASS（网口捅掉 20s），见 `docs/status.md` §2.9
 [x] 端到端延迟的正式测量 —— PASS（网关侧 ≲50ms；首帧等待 1.12~2.12s），见 `docs/status.md` §2.10
-[ ] 架构图、演示视频
+[x] 架构图 —— `docs/architecture.html`
+[ ] 演示视频
 ```
 
 已完成项的实测数据和根因分析见：
@@ -629,7 +632,7 @@ python .\tools\nv12_to_png.py frame.nv12 frame.png --width 1280 --height 720
                                 网络断开/恢复专项测试已跑（网口捅掉 20s，见 status.md §2.9）
 [x] 长时间运行测试              8 小时 864,001 帧；30 分钟带 IMU 长稳
 [x] 完整 README                 README 已全量对齐现状（2026-09-29）
-[ ] 架构图                      未产出
+[x] 架构图                      `docs/architecture.html`（自包含，按代码实际结构）
 [x] 测试报告                    docs/status.md 已补 OSD/IMU/根因章节
 [ ] 演示视频                    未产出
 ```
